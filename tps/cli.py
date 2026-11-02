@@ -25,7 +25,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from . import __version__, core
+from . import __version__, clis, core
 from .ui import UI, Bar, Col, Progress
 
 SCHEMA_VERSION = 1
@@ -123,10 +123,8 @@ def missing_clis(cfg: core.RunConfig) -> list[core.Target]:
 
 
 def cli_checks(cfg: core.RunConfig) -> list[tuple[str, str, bool]]:
-    """One doctor row per distinct CLI: installed, version, signed in, plan.
-
-    Uses `claude auth status --json`; the account email is never shown.
-    """
+    """One doctor row per distinct client: installed, version, signed in, plan.
+    The backend reads the sign-in; the account email is never shown."""
     rows = []
     seen: set[str] = set()
     for target in cfg.targets:
@@ -145,67 +143,40 @@ def cli_checks(cfg: core.RunConfig) -> list[tuple[str, str, bool]]:
         except (OSError, subprocess.TimeoutExpired) as exc:
             rows.append((binary, f"{path} · can't query it: {type(exc).__name__}", False))
             continue
-        status, why = cli_auth_status(path)
-        if status is None:
-            rows.append((binary, f"{version or path} · sign-in unknown — {why}", False))
-            continue
-        if not status.get("loggedIn"):
-            rows.append(
-                (binary, f"{version or path} · not signed in — run `{binary} auth login`", False)
-            )
-            continue
-        method = status.get("authMethod") or "?"
-        plan = status.get("subscriptionType")
-        detail = f"{version or path} · signed in ({method}{', ' + plan if plan else ''})"
-        if method != "claude.ai":
-            detail += " — not a subscription sign-in; usage is billed to that account"
-        rows.append((binary, detail, True))
+        auth = target.backend.auth(path)
+        where = version or path
+        if auth.signed_in is None:
+            rows.append((binary, f"{where} · sign-in unknown — {auth.why}", False))
+        elif not auth.signed_in:
+            rows.append((binary, f"{where} · not signed in — sign in with `{binary}` first", False))
+        else:
+            how = ", ".join(x for x in (auth.method, (auth.plan or "").lower() or None) if x)
+            detail = f"{where} · signed in" + (f" ({how})" if how else "")
+            if not auth.subscription:
+                detail += " — not a subscription sign-in; usage is billed to that account"
+            rows.append((binary, detail, True))
     return rows
-
-
-def cli_auth_status(path: str) -> tuple[dict[str, Any] | None, str]:
-    """`claude auth status --json` → (status, ""), or (None, why it couldn't be
-    read). Unreadable is reported as unknown, never as "not signed in"."""
-    try:
-        done = subprocess.run(
-            [path, "auth", "status", "--json"], capture_output=True, text=True, timeout=20
-        )
-    except subprocess.TimeoutExpired:
-        return None, "`auth status` timed out after 20s"
-    except OSError as exc:
-        return None, f"`auth status` failed: {exc.strerror or exc}"
-    try:
-        status = json.loads(done.stdout)
-    except ValueError:
-        status = None
-    if not isinstance(status, dict):
-        detail = (done.stderr or done.stdout).strip().splitlines()[-1:] or ["no output"]
-        return None, f"`auth status --json` unreadable (exit {done.returncode}: {detail[0][:80]})"
-    return status, ""
 
 
 def label_plans(cfg: core.RunConfig) -> None:
     """Name the plan each CLI target is signed in to ("Max"), for headers and
-    reports. Best effort: an unreadable status just leaves it unnamed."""
+    reports. An unreadable status just leaves it unnamed ("Claude plan")."""
     cache: dict[str, str | None] = {}
     for target in cfg.targets:
         path = target.cli_path() if target.is_cli else None
         if not path:
             continue
         if path not in cache:
-            # unreadable status → the plan just stays unnamed ("Claude plan")
-            status = cli_auth_status(path)[0] or {}
-            plan = (
-                status.get("subscriptionType") if status.get("authMethod") == "claude.ai" else None
-            )
-            cache[path] = str(plan).capitalize() if plan else None
+            auth = target.backend.auth(path)
+            cache[path] = auth.plan if auth.signed_in and auth.subscription else None
         target.plan = cache[path]
 
 
 def plan_title(rows: list[dict[str, Any]]) -> str:
-    """ "Claude Max plan" — or just "plan" when the CLI didn't say which."""
+    """ "Claude Max plan" — or just "plan" when the client didn't say which."""
     plans = sorted({r.get("plan") for r in rows} - {None})
-    vendor = "Claude " if all(r.get("api") == "claude-code" for r in rows) else ""
+    apis = {r.get("api") for r in rows}
+    vendor = clis.backend(next(iter(apis))).vendor + " " if len(apis) == 1 else ""
     return f"{vendor}{plans[0]} plan" if len(plans) == 1 else f"{vendor}plan".strip()
 
 
@@ -247,7 +218,9 @@ def endpoint_config(
         if stray:
             raise core.UsageError(f"{', '.join(stray)} can't apply to --api {args.api}")
         if not args.model:
-            raise core.UsageError(f"--api {args.api} needs --model, e.g. claude-opus-5-5")
+            raise core.UsageError(
+                f"--api {args.api} needs --model, e.g. {clis.backend(args.api).example_model}"
+            )
         return core.cli_target_toml(
             args.api,
             models,
@@ -288,7 +261,7 @@ def _effort_list(text: str | None, api: str | None) -> list[str] | None:
     if text is None:
         return None
     levels = [e.strip().lower() for e in text.split(",") if e.strip()]
-    allowed = core.EFFORTS if api in core.CLI_APIS else core.EFFORTS_HTTP
+    allowed = clis.backend(api).efforts if api in core.CLI_APIS else core.EFFORTS_HTTP
     bad = [e for e in levels if e not in (*allowed, "default")]
     if not levels or bad:
         raise core.UsageError(
@@ -1560,20 +1533,18 @@ def cmd_run(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
     }
 
 
-CLAUDE_MODELS = ("opus", "sonnet", "haiku")  # Claude Code's aliases for the latest of each
-
-
-def cmd_claude(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
-    """`tps claude [models…]`: benchmark the models in your Claude plan.
-
-    A shortcut for `tps run --api claude-code …` with plan-friendly defaults;
-    it runs the very same code, so output, JSON and exit codes match `run`.
+def cmd_plan(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
+    """`tps claude [models…]` (one command per CLI backend): benchmark the
+    models in your plan. A shortcut for `tps run --api <backend> …` with
+    plan-friendly defaults; it runs the very same code, so output, JSON and
+    exit codes match `run`.
     """
-    models = [m for arg in (args.models or CLAUDE_MODELS) for m in arg.split(",") if m]
+    backend = clis.backend(args.backend_api)
+    models = [m for arg in (args.models or backend.default_models) for m in arg.split(",") if m]
     efforts = None
     if args.effort:
-        efforts = ",".join(core.EFFORTS) if args.effort.strip() == "all" else args.effort
-    run_argv = ["run", "--api", "claude-code", "--model", ",".join(models)]
+        efforts = ",".join(backend.efforts) if args.effort.strip() == "all" else args.effort
+    run_argv = ["run", "--api", backend.api, "--model", ",".join(models)]
     run_argv += ["--max-tokens", str(args.max_tokens), "--reps", str(args.reps)]
     run_argv += ["--prompts", args.prompt]
     if efforts:
@@ -1585,7 +1556,7 @@ def cmd_claude(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
     run_args = build_parser().parse_args(run_argv)
     for flag in ("json", "no_color", "quiet", "verbose"):
         setattr(run_args, flag, getattr(args, flag, False))
-    run_args.label = "claude"
+    run_args.label = backend.command
 
     interactive = sys.stdin.isatty() and sys.stdout.isatty() and not ui.silent
     if args.dry_run or (interactive and not args.yes and not args.mock):
@@ -1778,8 +1749,12 @@ def build_parser() -> argparse.ArgumentParser:
             choices=core.APIS,
             default=None,
             help=f"wire format (default openai); anthropic = native Claude API, {CLAUDE_API_URL} "
-            "unless a URL is given; claude-code = your Claude plan, via the signed-in "
-            "`claude` CLI (no URL or key)",
+            "unless a URL is given; "
+            + "; ".join(
+                f"{b.api} = your {b.vendor} plan via the signed-in `{b.binary}` CLI"
+                for b in clis.BACKENDS.values()
+            )
+            + " (no URL or key)",
         )
         p.add_argument(
             "--effort",
@@ -1834,55 +1809,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--no-warmup", action="store_true", help="skip discarded warm-up requests")
     common(p_run)
 
-    p_claude = sub.add_parser(
-        "claude",
-        help="benchmark the models in your Claude plan",
-        description=(
-            "Benchmark the models in your Claude subscription (Pro, Max, Team) through\n"
-            "the signed-in `claude` CLI. Runs on plan usage; nothing is billed per token."
-        ),
-        epilog=(
-            "models: opus, sonnet, haiku (the latest of each), or full ids\n"
-            "effort: low, medium, high, xhigh, max, default, or all\n"
-            "\n"
-            "examples:\n"
-            "  tps claude                          opus, sonnet and haiku at default effort\n"
-            "  tps claude opus sonnet -e low,high  two models × two effort levels\n"
-            "  tps claude opus -e all              one model, every effort level\n"
-            "  tps claude haiku -n 10              more reps for a tighter number\n"
-            "  tps claude --dry-run                what it would send, and how long it takes\n"
-            "\n"
-            "the long form, for configs and scripts: tps run --api claude-code --model …"
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    p_claude.add_argument("models", nargs="*", metavar="MODEL", help="default: opus sonnet haiku")
-    p_claude.add_argument(
-        "-e", "--effort", default=None, metavar="LEVELS", help="e.g. low,high or all"
-    )
-    p_claude.add_argument(
-        "-n", "--reps", type=int, default=5, metavar="N", help="runs per model × level (5)"
-    )
-    p_claude.add_argument(
-        "--prompt",
-        default="prose-256",
-        metavar="NAME",
-        help="prose-256 (default), code-256 or long-context",
-    )
-    p_claude.add_argument(
-        "--max-tokens",
-        type=int,
-        default=2048,
-        metavar="N",
-        help="answer cap (2048: room to think, then answer)",
-    )
-    p_claude.add_argument(
-        "-o", "--out", type=Path, default=None, metavar="DIR", help="run directory to create"
-    )
-    p_claude.add_argument("--dry-run", action="store_true", help="show the plan; send nothing")
-    p_claude.add_argument("-y", "--yes", action="store_true", help="don't ask before running")
-    p_claude.add_argument("--mock", action="store_true", help="synthetic numbers, no network")
-    common(p_claude)
+    for backend in clis.BACKENDS.values():
+        plan_shortcut(sub, backend, common)
 
     p_rep = sub.add_parser("report", help="re-render a previous run")
     p_rep.add_argument("run_dir", type=Path, help="folder printed by `tps run`")
@@ -1902,12 +1830,64 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def plan_shortcut(sub, backend: clis.CliBackend, common) -> None:
+    """`tps <vendor>`: the models in that plan, from the backend's own words."""
+    width = max(len(a) for a, _ in backend.examples) + len(backend.command) + 7
+    examples = "".join(
+        f"  {f'tps {backend.command} {a}'.rstrip():<{width}}{what}\n"
+        for a, what in backend.examples
+    )
+    p = sub.add_parser(
+        backend.command,
+        help=f"benchmark the models in your {backend.vendor} plan",
+        description=(
+            f"Benchmark the models in your {backend.vendor} subscription through the signed-in\n"
+            f"`{backend.binary}` CLI. Runs on plan usage; nothing is billed per token."
+        ),
+        epilog=(
+            f"models: {backend.model_help}\n"
+            f"effort: {', '.join(backend.efforts)}, default, or all\n\n"
+            f"examples:\n{examples}\n"
+            f"the long form, for configs and scripts: tps run --api {backend.api} --model …"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.set_defaults(backend_api=backend.api)
+    p.add_argument(
+        "models", nargs="*", metavar="MODEL", help=f"default: {' '.join(backend.default_models)}"
+    )
+    p.add_argument("-e", "--effort", default=None, metavar="LEVELS", help="e.g. low,high or all")
+    p.add_argument(
+        "-n", "--reps", type=int, default=5, metavar="N", help="runs per model × level (5)"
+    )
+    p.add_argument(
+        "--prompt",
+        default="prose-256",
+        metavar="NAME",
+        help="prose-256 (default), code-256 or long-context",
+    )
+    p.add_argument(
+        "--max-tokens",
+        type=int,
+        default=2048,
+        metavar="N",
+        help="answer cap (2048: room to think, then answer)",
+    )
+    p.add_argument(
+        "-o", "--out", type=Path, default=None, metavar="DIR", help="run directory to create"
+    )
+    p.add_argument("--dry-run", action="store_true", help="show the plan; send nothing")
+    p.add_argument("-y", "--yes", action="store_true", help="don't ask before running")
+    p.add_argument("--mock", action="store_true", help="synthetic numbers, no network")
+    common(p)
+
+
 COMMANDS = {
     "doctor": cmd_doctor,
     "init": cmd_init,
     "discover": cmd_discover,
     "run": cmd_run,
-    "claude": cmd_claude,
+    **{command: cmd_plan for command in clis.by_command()},
     "report": cmd_report,
     "fingerprint": cmd_fingerprint,
 }

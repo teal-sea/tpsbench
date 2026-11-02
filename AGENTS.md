@@ -52,6 +52,9 @@ effective settings (overrides included), and never replaces a different
 `--api anthropic` (or `api = "anthropic"` on a target) uses the native Claude
 Messages API with an API key; it sends no `temperature` (Claude 4.7+ 400s on it)
 and keeps hidden thinking out of tok/s. A Claude **subscription** is measured with
+Subscription CLIs are adapters in `tps/clis.py` (`CliBackend`; see
+CONTRIBUTING.md → Adding a subscription CLI); the loop in `core.cli_once` is
+shared — never add vendor branches to it.
 `tps claude [opus sonnet haiku] [-e low,high]` is the short form: it runs
 exactly `run --api claude-code` (same JSON, `command: "run"`), defaults to
 opus/sonnet/haiku, 5 reps, `--max-tokens 2048`, and asks before running only on

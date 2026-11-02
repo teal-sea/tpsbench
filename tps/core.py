@@ -22,7 +22,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from . import __version__
+from . import __version__, clis
 
 try:  # HTTP/2 is a nice-to-have; HTTP/1.1 is fine and universally supported
     import h2  # noqa: F401
@@ -70,12 +70,11 @@ USER_AGENT = f"tps/{__version__} (+https://github.com/teal-sea/tpsbench)"
 
 ANTHROPIC_VERSION = "2023-06-01"
 ANTHROPIC_OAUTH_BETA = "oauth-2025-04-20"
-# "claude-code" spawns the signed-in `claude` CLI headless: the supported way to
-# measure a Claude subscription plan (plan tokens are only honored by Anthropic's
-# own client, so tps never extracts or replays them over HTTP)
-CLI_APIS = ("claude-code",)
+# CLI targets ("claude-code", …) spawn a vendor's signed-in client headless: the
+# supported way to measure a subscription plan, whose tokens only the vendor's
+# own client may use. Each client is an adapter in clis.py.
+CLI_APIS = clis.CLI_APIS
 APIS = ("openai", "anthropic", *CLI_APIS)
-CLI_DEFAULT_BINARY = {"claude-code": "claude"}
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 # HTTP APIs: what each provider accepts varies by model (OpenAI also has
 # "minimal"); an unsupported level is the provider's 400, recorded as data
@@ -86,9 +85,6 @@ EFFORT_FIELDS = {
     "openrouter": "reasoning",
     "openai": "reasoning_effort",
 }
-# credentials a child `claude` would prefer over the signed-in plan (`-p` uses an
-# API key whenever one is set); dropped so `claude-code` measures the plan
-CLAUDE_CODE_STRIP_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 # what the CLI spends before the first byte of the request (process start,
 # config load); dry-run budgets it per request
 PLAN_CLI_STARTUP_S = 2.0
@@ -237,7 +233,7 @@ class Target:
     api: str = "openai"
     # reasoning effort; None = the model's default (sent as nothing at all)
     effort: str | None = None
-    # CLI targets: the executable to spawn (default: `claude` for claude-code)
+    # CLI targets: the executable to spawn (default: the backend's, e.g. `claude`)
     cli: str | None = None
     # CLI targets: the plan the CLI is signed in to ("max"), when it says
     plan: str | None = None
@@ -246,8 +242,12 @@ class Target:
     def is_cli(self) -> bool:
         return self.api in CLI_APIS
 
+    @property
+    def backend(self) -> clis.CliBackend:
+        return clis.backend(self.api)
+
     def cli_binary(self) -> str:
-        return self.cli or CLI_DEFAULT_BINARY.get(self.api, "")
+        return self.cli or (self.backend.binary if self.is_cli else "")
 
     def cli_path(self) -> str | None:
         """Absolute path of the CLI to spawn, or None when it isn't installed."""
@@ -520,7 +520,7 @@ def config_from_dict(raw: dict[str, Any], path: Path) -> RunConfig:
         effort = entry.get("effort")
         if effort is not None:
             effort = str(effort).lower()
-            allowed = EFFORTS if api in CLI_APIS else EFFORTS_HTTP
+            allowed = clis.backend(api).efforts if api in CLI_APIS else EFFORTS_HTTP
             if effort not in allowed:
                 raise UsageError(f"{path}: {label}: `effort` must be one of {', '.join(allowed)}")
         if api in CLI_APIS:
@@ -1016,57 +1016,16 @@ def parse_event(obj: dict[str, Any], api: str) -> dict[str, Any]:
 # CLI targets: a vendor's own client, run headless
 # --------------------------------------------------------------------------
 
-# The CLI's default context (tools, MCP servers, skills, settings, CLAUDE.md)
-# is ~245k tokens for a configured user; benchmarking that would time prefill
-# of the user's setup, not the model. Strip it to one user message.
-CLAUDE_CODE_SYSTEM_PROMPT = "You are a helpful assistant."
-
 
 def cli_workdir() -> str:
-    """An empty directory to run CLIs in, so no project CLAUDE.md or .claude/
-    loads. Stable across runs: Claude Code keys per-project state on the
-    working directory, and a fresh temp dir would leave a new entry each run."""
+    """An empty directory to run clients in, so no project files (CLAUDE.md,
+    AGENTS.md, .claude/, …) load. Stable across runs: clients key per-project
+    state on the working directory, and a fresh temp dir would add an entry
+    every run."""
     base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
     path = os.path.join(base, "tps", "cli-workdir")
     os.makedirs(path, mode=0o700, exist_ok=True)
     return path
-
-
-def cli_command(target: Target) -> list[str]:
-    """argv for one headless request; the prompt goes on stdin."""
-    cmd = [
-        target.cli_path() or target.cli_binary(),
-        "-p",
-        "--model",
-        target.model,
-        "--output-format",
-        "stream-json",
-        "--include-partial-messages",
-        "--verbose",
-        "--tools",
-        "",
-        "--strict-mcp-config",
-        "--mcp-config",
-        '{"mcpServers":{}}',
-        "--setting-sources",
-        "",
-        "--disable-slash-commands",
-        "--no-session-persistence",
-        "--system-prompt",
-        CLAUDE_CODE_SYSTEM_PROMPT,
-    ]
-    if target.effort:
-        cmd += ["--effort", target.effort]
-    return cmd
-
-
-def cli_env(max_tokens: int) -> dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if k not in CLAUDE_CODE_STRIP_ENV}
-    env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(max_tokens)
-    # failures are data (invariant 1): the client must not retry on our behalf
-    env["CLAUDE_CODE_MAX_RETRIES"] = "0"
-    env["CLAUDE_CODE_NONSTREAMING_TIMEOUT_RETRIES"] = "0"
-    return env
 
 
 async def _stop(proc: asyncio.subprocess.Process) -> None:
@@ -1092,17 +1051,16 @@ async def cli_once(
 ) -> Sample:
     """One request through a CLI target, timed like an HTTP stream.
 
-    Claude Code's stream-json output wraps the Messages API events
-    (`stream_event`), so they go through the same parser and the same
-    counting as `api = "anthropic"`. TTFT runs from process start, so it
+    The backend (clis.py) turns each line of the client's output into a
+    CliEvent; this loop times them exactly as HTTP streams are timed and counts
+    them with the same finish_sample(). TTFT runs from process start, so it
     includes client startup; `startup_s` says how much of it that was.
 
-    Only the first API call is measured. When a response hits the output cap
-    Claude Code silently sends continuation requests (each with its own TTFT
-    inside what would look like decode time) and finally reports an error;
-    the process is stopped at the first `message_stop`, so the cap is a real
-    per-request cap and no extra plan usage is spent.
+    Only the first API call is measured: the client is stopped at the end of
+    the first response (immediately when it would continue a capped one), so
+    the cap is a real per-request cap and no extra plan usage is spent.
     """
+    backend = target.backend
     sample = Sample(
         target=target.name,
         prompt=prompt_name,
@@ -1115,20 +1073,20 @@ async def cli_once(
     gaps: list[float] = []
     chars = reasoning_chars = first_chars = 0
     usage: dict[str, Any] = {}
-    result: dict[str, Any] | None = None
+    failure: clis.CliEvent | None = None
     stopped = False
     plan_rejected = False
 
     t0 = time.perf_counter()
     try:
         proc = await asyncio.create_subprocess_exec(
-            *cli_command(target),
+            *backend.argv(target.cli_path() or target.cli_binary(), target.model, target.effort),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=cli_env(max_tokens),
+            env=backend.env(max_tokens),
             cwd=cli_workdir(),
-            limit=1 << 24,  # one stream-json line can carry a whole message
+            limit=1 << 24,  # one JSON line can carry a whole message
         )
     except OSError as exc:
         sample.error = f"cli_missing: {target.cli_binary()}: {exc.strerror or exc}"
@@ -1138,64 +1096,57 @@ async def cli_once(
     stdin, stdout = proc.stdin, proc.stdout
     stderr_task = asyncio.create_task(proc.stderr.read())
 
-    def rate_limit(obj: dict[str, Any]) -> None:
+    def read(raw: bytes) -> clis.CliEvent | None:
+        try:
+            obj = json.loads(raw)
+        except ValueError:
+            return None
+        return backend.parse(obj) if isinstance(obj, dict) else None
+
+    def note_plan(event: clis.CliEvent) -> None:
         nonlocal plan_rejected
-        info = obj.get("rate_limit_info") or {}
-        plan_rejected = plan_rejected or info.get("status") == "rejected"
-        window = info.get("rateLimitType")
-        usage_now = ((info.get("unifiedWindows") or {}).get(window) or {}).get("utilization")
-        if isinstance(usage_now, int | float):
-            sample.plan_utilization, sample.plan_window = float(usage_now), window
+        plan_rejected = plan_rejected or event.plan_rejected
+        if event.plan_utilization is not None:
+            sample.plan_utilization, sample.plan_window = event.plan_utilization, event.plan_window
 
     async def consume() -> None:
-        nonlocal first, last, chars, reasoning_chars, first_chars, result, stopped
+        nonlocal first, last, chars, reasoning_chars, first_chars, failure, stopped
         stdin.write(prompt_text.encode("utf-8"))
         await stdin.drain()
         stdin.close()
         async for raw in stdout:
-            try:
-                obj = json.loads(raw)
-            except ValueError:
+            event = read(raw)
+            if event is None:
                 continue
-            if not isinstance(obj, dict):
-                continue
-            kind = obj.get("type")
-            if kind == "result":
-                result = obj
-                continue
-            if kind == "rate_limit_event":
-                rate_limit(obj)
-                continue
-            if kind != "stream_event" or not isinstance(obj.get("event"), dict):
+            note_plan(event)
+            if event.error:
+                failure = event
+            if not event.stream:
                 continue
             if stopped:
                 return  # a second API call (a continuation): never measured
             now = time.perf_counter()
             if sample.startup_s is None:
                 sample.startup_s = now - t0
-            message = obj["event"].get("message")
-            if isinstance(message, dict) and isinstance(message.get("model"), str):
-                sample.served_model = message["model"]
-            event = parse_event(obj["event"], "anthropic")
-            usage.update(event["usage"])
-            if event["finish"]:
-                sample.finish_reason = event["finish"]
-            if event["stop"]:
-                # first API call complete: the measurement ends here
+            if event.model:
+                sample.served_model = event.model
+            usage.update(event.usage)
+            if event.finish:
+                sample.finish_reason = event.finish
+            if event.stop:
+                # first response complete: the measurement ends here
                 stopped = True
                 sample.e2e_s = now - t0
-                if sample.finish_reason == "length":
-                    # a continuation request follows: take the plan's rate-limit
-                    # event if it is the very next line, then stop the client
-                    with contextlib.suppress(TimeoutError, ValueError):
-                        line = await asyncio.wait_for(stdout.readline(), 0.25)
-                        follow = json.loads(line) if line.strip() else {}
-                        if isinstance(follow, dict) and follow.get("type") == "rate_limit_event":
-                            rate_limit(follow)
+                if sample.finish_reason == "length" and backend.continues_after_cap:
+                    # a continuation request follows: take a plan reading if it
+                    # is the very next line, then stop the client
+                    with contextlib.suppress(TimeoutError):
+                        follow = read(await asyncio.wait_for(stdout.readline(), 0.25))
+                        if follow is not None and not follow.stream:
+                            note_plan(follow)
                     return
-                continue  # read on, untimed, for the plan's rate-limit event
-
-            piece, reasoning = event["piece"], event["reasoning"]
+                continue  # read on, untimed, for the plan's usage reading
+            piece, reasoning = event.piece, event.reasoning
             if not piece and not reasoning:
                 continue
             size = len(piece) + len(reasoning)
@@ -1217,7 +1168,7 @@ async def cli_once(
             await asyncio.wait_for(consume(), cfg.timeout_s)
         except TimeoutError:
             # a slow exit after a complete answer isn't the model's failure:
-            # only an unfinished first call is a timeout
+            # only an unfinished first response is a timeout
             if not stopped:
                 sample.error = "timeout"
         except (OSError, ValueError) as exc:  # broken pipe, oversized line
@@ -1239,27 +1190,18 @@ async def cli_once(
     sample.served_by = target.api
 
     if not stopped:
-        if result is not None and result.get("is_error"):
-            status = result.get("api_error_status")
-            message = str(result.get("result") or result.get("subtype") or "error")
-            sample.status = status if isinstance(status, int) else None
-            limited = status == 429 or plan_rejected or "rate limit" in message.lower()
+        if failure is not None:
+            message = failure.error or "error"
+            sample.status = failure.status
+            limited = failure.status == 429 or plan_rejected or "rate limit" in message.lower()
             sample.error = ("rate_limited: " if limited else "cli_error: ") + message[:300]
         elif plan_rejected:
-            sample.error = "rate_limited: plan limit reached (rate_limit_event: rejected)"
+            sample.error = "rate_limited: plan limit reached (the client's rate-limit event)"
         elif code != 0:
             sample.error = f"cli_exit_{code}: {stderr[-300:] or 'no output'}"
         else:
-            sample.error = "incomplete_stream: ended without message_stop"
+            sample.error = "incomplete_stream: the response never finished"
         return sample
-    # what the model actually read: Claude Code sends the prompt with cache
-    # control, so most of it is reported as cache creation/read, not input
-    in_parts = [
-        usage.get(k)
-        for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
-    ]
-    if any(isinstance(v, int) for v in in_parts):
-        usage["input_tokens"] = sum(v for v in in_parts if isinstance(v, int))
     return finish_sample(
         sample, usage, prompt_text, first, last, gaps, chars, reasoning_chars, first_chars
     )

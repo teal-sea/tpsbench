@@ -32,7 +32,7 @@ sys.path.insert(0, str(ROOT))
 try:
     import httpx  # noqa: E402
 
-    from tps import core  # noqa: E402
+    from tps import clis, core  # noqa: E402
 except ModuleNotFoundError as exc:
     raise SystemExit(
         f"selftest: `{exc.name}` is not installed — set up the dev environment first "
@@ -2272,6 +2272,71 @@ async def main() -> int:
             check(
                 "cli: Ctrl-C/cancel stops the client (no orphan on the plan)", not alive, str(pid)
             )
+            # The loop must not be Claude-shaped: a made-up client with its own
+            # output format plugs in through a backend alone (as Codex will).
+            other = work / "fake-other"
+            other.write_text(
+                f"#!{sys.executable}\n"
+                "import json, sys, time\n"
+                "sys.stdin.read()\n"
+                "def out(o): print(json.dumps(o), flush=True)\n"
+                "out({'kind': 'begin', 'model': 'other-1'})\n"
+                "for _ in range(10):\n"
+                "    out({'kind': 'text', 'v': 'word'}); time.sleep(0.01)\n"
+                "out({'kind': 'end', 'reason': 'done', 'out': 12, 'in': 7, 'hidden': 2})\n"
+                "out({'kind': 'quota', 'used': 0.3})\n",
+                encoding="utf-8",
+            )
+            other.chmod(0o755)
+
+            class OtherCli(clis.CliBackend):
+                api, command, binary, vendor = "other-cli", "other", "other", "Other"
+                efforts, default_models = ("low",), ("o",)
+                model_help, example_model, examples = "o", "o", (("", "o"),)
+
+                def argv(self, path, model, effort):
+                    return [path, model]
+
+                def env(self, max_tokens):
+                    return dict(os.environ)
+
+                def parse(self, obj):
+                    kind = obj.get("kind")
+                    if kind == "begin":
+                        return clis.CliEvent(stream=True, model=obj["model"])
+                    if kind == "text":
+                        return clis.CliEvent(stream=True, piece=obj["v"])
+                    if kind == "end":
+                        usage = {
+                            "output_tokens": obj["out"],
+                            "input_tokens": obj["in"],
+                            "output_tokens_details": {"thinking_tokens": obj["hidden"]},
+                        }
+                        return clis.CliEvent(stream=True, stop=True, finish="stop", usage=usage)
+                    if kind == "quota":
+                        return clis.CliEvent(plan_window="month", plan_utilization=obj["used"])
+                    return None
+
+                def auth(self, path):
+                    return clis.Auth(signed_in=True, plan="Pro")
+
+            clis.BACKENDS["other-cli"] = OtherCli()
+            try:
+                t = core.Target(name="o", base_url="", model="o", api="other-cli", cli=str(other))
+                done = await core.cli_once(t, "hi", "p", 64, cli_cfg, 1, 0)
+            finally:
+                del clis.BACKENDS["other-cli"]
+            check(
+                "backend contract: a second client works through an adapter alone",
+                done.ok
+                and done.out_tokens == 12
+                and done.hidden_reasoning_tokens == 2
+                and done.served_model == "other-1"
+                and done.plan_utilization == 0.3
+                and done.out_tps is not None,
+                f"{done.ok} {done.error} {done.out_tokens} {done.served_model} {done.plan_utilization}",
+            )
+
             limited = await core.cli_once(cc("cc-ratelimit"), "hi", "p", 64, cli_cfg, 1, 0)
             check(
                 "cli: 429 → rate_limited, no retry",
