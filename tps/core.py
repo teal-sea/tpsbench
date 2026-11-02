@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import csv
 import json
 import math
 import os
+import shutil
 import statistics
 import sys
 import time
@@ -68,7 +70,19 @@ USER_AGENT = f"tps/{__version__} (+https://github.com/teal-sea/tpsbench)"
 
 ANTHROPIC_VERSION = "2023-06-01"
 ANTHROPIC_OAUTH_BETA = "oauth-2025-04-20"
-APIS = ("openai", "anthropic")
+# "claude-code" spawns the signed-in `claude` CLI headless: the supported way to
+# measure a Claude subscription plan (plan tokens are only honored by Anthropic's
+# own client, so tps never extracts or replays them over HTTP)
+CLI_APIS = ("claude-code",)
+APIS = ("openai", "anthropic", *CLI_APIS)
+CLI_DEFAULT_BINARY = {"claude-code": "claude"}
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+# credentials a child `claude` would prefer over the signed-in plan (`-p` uses an
+# API key whenever one is set); dropped so `claude-code` measures the plan
+CLAUDE_CODE_STRIP_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+# what the CLI spends before the first byte of the request (process start,
+# config load); dry-run budgets it per request
+PLAN_CLI_STARTUP_S = 2.0
 # Claude API stop reasons in OpenAI's vocabulary, so one report covers both
 ANTHROPIC_STOP = {
     "max_tokens": "length",
@@ -212,6 +226,26 @@ class Target:
     # "openai" = /chat/completions; "anthropic" = the native Claude Messages
     # API, the only one that accepts Claude subscription (OAuth) tokens
     api: str = "openai"
+    # reasoning effort; None = the model's default. CLI targets only for now.
+    effort: str | None = None
+    # CLI targets: the executable to spawn (default: `claude` for claude-code)
+    cli: str | None = None
+    # CLI targets: the plan the CLI is signed in to ("max"), when it says
+    plan: str | None = None
+
+    @property
+    def is_cli(self) -> bool:
+        return self.api in CLI_APIS
+
+    def cli_binary(self) -> str:
+        return self.cli or CLI_DEFAULT_BINARY.get(self.api, "")
+
+    def cli_path(self) -> str | None:
+        """Absolute path of the CLI to spawn, or None when it isn't installed."""
+        binary = os.path.expanduser(self.cli_binary())
+        if os.sep in binary:
+            return binary if os.access(binary, os.X_OK) else None
+        return shutil.which(binary)
 
     def url(self) -> str:
         base = self.base_url.rstrip("/")
@@ -256,6 +290,8 @@ class Target:
 
     def needs_key(self) -> bool:
         """True when a real request would go out unauthenticated to a remote host."""
+        if self.is_cli:
+            return False  # the CLI brings its own sign-in; doctor checks it
         return not self.key() and not is_local(self.base_url)
 
     def note(self) -> str:
@@ -336,6 +372,8 @@ def request_temperature(cfg: RunConfig, target: Target) -> float | None:
     """
     if cfg.temperature == "omit":
         return None
+    if target.is_cli:
+        return None  # the CLI exposes no sampling parameters
     if cfg.temperature is None:
         return None if target.api == "anthropic" else 0.0
     return float(cfg.temperature)
@@ -399,13 +437,39 @@ def config_from_dict(raw: dict[str, Any], path: Path) -> RunConfig:
     targets: list[Target] = []
     for index, entry in enumerate(target_dicts, start=1):
         label = entry.get("name") or f"target #{index}"
-        for key in ("base_url", "model"):
-            if not entry.get(key):
-                raise UsageError(f"{path}: {label} is missing `{key}`")
-        price = _table(entry, "price", label, path)
         api = str(entry.get("api", "openai"))
         if api not in APIS:
             raise UsageError(f"{path}: {label}: `api` must be one of {', '.join(APIS)}")
+        # a CLI target has no URL: the vendor's client decides where requests go
+        for key in ("model",) if api in CLI_APIS else ("base_url", "model"):
+            if not entry.get(key):
+                raise UsageError(f"{path}: {label} is missing `{key}`")
+        price = _table(entry, "price", label, path)
+        effort = entry.get("effort")
+        if effort is not None:
+            effort = str(effort).lower()
+            if api not in CLI_APIS:
+                raise UsageError(
+                    f"{path}: {label}: `effort` is only supported on CLI targets "
+                    f"({', '.join(CLI_APIS)}) so far"
+                )
+            if effort not in EFFORTS:
+                raise UsageError(f"{path}: {label}: `effort` must be one of {', '.join(EFFORTS)}")
+        if api in CLI_APIS:
+            unsupported = sorted(
+                k
+                for k in ("api_key", "api_key_env", "headers", "extra_body", "max_tokens_field")
+                if entry.get(k)
+            )
+            if unsupported:
+                raise UsageError(
+                    f"{path}: {label}: {', '.join(unsupported)} can't apply to api = {api!r} — "
+                    "the CLI uses its own sign-in and request format"
+                )
+        elif entry.get("cli"):
+            raise UsageError(
+                f"{path}: {label}: `cli` only applies to {', '.join(CLI_APIS)} targets"
+            )
         extra_body = _table(entry, "extra_body", label, path)
         # the token-cap field can be renamed per target or for the whole run
         cap_fields = {entry.get("max_tokens_field"), run.get("max_tokens_field")}
@@ -419,7 +483,7 @@ def config_from_dict(raw: dict[str, Any], path: Path) -> RunConfig:
         targets.append(
             Target(
                 name=str(entry.get("name") or entry["model"]),
-                base_url=entry["base_url"],
+                base_url=str(entry.get("base_url") or ""),
                 model=entry["model"],
                 api_key_env=entry.get("api_key_env"),
                 api_key=entry.get("api_key"),
@@ -431,6 +495,8 @@ def config_from_dict(raw: dict[str, Any], path: Path) -> RunConfig:
                 send_stream_options=bool(entry.get("stream_options", True)),
                 mock=_table(entry, "mock", label, path) if "mock" in entry else None,
                 api=api,
+                effort=effort,
+                cli=str(entry["cli"]) if entry.get("cli") else None,
             )
         )
 
@@ -521,6 +587,13 @@ class Sample:
     finish_reason: str | None = None  # "length" = stopped by max_tokens
     reasoning_tokens: int | None = None  # from usage: OpenAI or Claude token details
     hidden_reasoning_tokens: int = 0  # billed and generated, but never streamed
+    # CLI targets: process start → first stream event (client startup + the
+    # request reaching the API). TTFT for CLI targets includes this.
+    startup_s: float | None = None
+    # CLI targets: share of the plan's usage window used, as the client reports
+    # it after this request (0–1), and which window ("five_hour")
+    plan_utilization: float | None = None
+    plan_window: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
@@ -691,7 +764,28 @@ async def stream_once(
     if stream_error:
         sample.error = stream_error
         return sample
+    return finish_sample(
+        sample, usage, prompt_text, first, last, gaps, chars, reasoning_chars, first_chars
+    )
 
+
+def finish_sample(
+    sample: Sample,
+    usage: dict[str, Any],
+    prompt_text: str,
+    first: float | None,
+    last: float | None,
+    gaps: list[float],
+    chars: int,
+    reasoning_chars: int,
+    first_chars: int,
+) -> Sample:
+    """Token counts, rates and the ok/error verdict for one complete stream.
+
+    Shared by HTTP and CLI targets so both are counted and timed identically:
+    `first`/`last` are perf_counter times of the first and last streamed text,
+    `gaps` the seconds between answer chunks.
+    """
     estimated = False
     if usage:
         sample.out_tokens = _first_present(
@@ -840,6 +934,246 @@ def parse_event(obj: dict[str, Any], api: str) -> dict[str, Any]:
     return event
 
 
+# --------------------------------------------------------------------------
+# CLI targets: a vendor's own client, run headless
+# --------------------------------------------------------------------------
+
+# The CLI's default context (tools, MCP servers, skills, settings, CLAUDE.md)
+# is ~245k tokens for a configured user; benchmarking that would time prefill
+# of the user's setup, not the model. Strip it to one user message.
+CLAUDE_CODE_SYSTEM_PROMPT = "You are a helpful assistant."
+
+
+def cli_workdir() -> str:
+    """An empty directory to run CLIs in, so no project CLAUDE.md or .claude/
+    loads. Stable across runs: Claude Code keys per-project state on the
+    working directory, and a fresh temp dir would leave a new entry each run."""
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    path = os.path.join(base, "tps", "cli-workdir")
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    return path
+
+
+def cli_command(target: Target) -> list[str]:
+    """argv for one headless request; the prompt goes on stdin."""
+    cmd = [
+        target.cli_path() or target.cli_binary(),
+        "-p",
+        "--model",
+        target.model,
+        "--output-format",
+        "stream-json",
+        "--include-partial-messages",
+        "--verbose",
+        "--tools",
+        "",
+        "--strict-mcp-config",
+        "--mcp-config",
+        '{"mcpServers":{}}',
+        "--setting-sources",
+        "",
+        "--disable-slash-commands",
+        "--no-session-persistence",
+        "--system-prompt",
+        CLAUDE_CODE_SYSTEM_PROMPT,
+    ]
+    if target.effort:
+        cmd += ["--effort", target.effort]
+    return cmd
+
+
+def cli_env(max_tokens: int) -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k not in CLAUDE_CODE_STRIP_ENV}
+    env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(max_tokens)
+    # failures are data (invariant 1): the client must not retry on our behalf
+    env["CLAUDE_CODE_MAX_RETRIES"] = "0"
+    env["CLAUDE_CODE_NONSTREAMING_TIMEOUT_RETRIES"] = "0"
+    return env
+
+
+async def _stop(proc: asyncio.subprocess.Process) -> None:
+    if proc.returncode is None:
+        with contextlib.suppress(ProcessLookupError):
+            proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), 5)
+        except TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            await proc.wait()
+
+
+async def cli_once(
+    target: Target,
+    prompt_text: str,
+    prompt_name: str,
+    max_tokens: int,
+    cfg: RunConfig,
+    concurrency: int,
+    batch: int,
+) -> Sample:
+    """One request through a CLI target, timed like an HTTP stream.
+
+    Claude Code's stream-json output wraps the Messages API events
+    (`stream_event`), so they go through the same parser and the same
+    counting as `api = "anthropic"`. TTFT runs from process start, so it
+    includes client startup; `startup_s` says how much of it that was.
+
+    Only the first API call is measured. When a response hits the output cap
+    Claude Code silently sends continuation requests (each with its own TTFT
+    inside what would look like decode time) and finally reports an error;
+    the process is stopped at the first `message_stop`, so the cap is a real
+    per-request cap and no extra plan usage is spent.
+    """
+    sample = Sample(
+        target=target.name,
+        prompt=prompt_name,
+        concurrency=concurrency,
+        batch=batch,
+        ok=False,
+        wall_clock=now_iso(),
+    )
+    first = last = None
+    gaps: list[float] = []
+    chars = reasoning_chars = first_chars = 0
+    usage: dict[str, Any] = {}
+    result: dict[str, Any] | None = None
+    stopped = False
+    plan_rejected = False
+
+    t0 = time.perf_counter()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cli_command(target),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=cli_env(max_tokens),
+            cwd=cli_workdir(),
+            limit=1 << 24,  # one stream-json line can carry a whole message
+        )
+    except OSError as exc:
+        sample.error = f"cli_missing: {target.cli_binary()}: {exc.strerror or exc}"
+        sample.e2e_s = time.perf_counter() - t0
+        return sample
+    assert proc.stdin and proc.stdout and proc.stderr
+    stdin, stdout = proc.stdin, proc.stdout
+    stderr_task = asyncio.create_task(proc.stderr.read())
+
+    def rate_limit(obj: dict[str, Any]) -> None:
+        nonlocal plan_rejected
+        info = obj.get("rate_limit_info") or {}
+        plan_rejected = plan_rejected or info.get("status") == "rejected"
+        window = info.get("rateLimitType")
+        usage_now = ((info.get("unifiedWindows") or {}).get(window) or {}).get("utilization")
+        if isinstance(usage_now, int | float):
+            sample.plan_utilization, sample.plan_window = float(usage_now), window
+
+    async def consume() -> None:
+        nonlocal first, last, chars, reasoning_chars, first_chars, result, stopped
+        stdin.write(prompt_text.encode("utf-8"))
+        await stdin.drain()
+        stdin.close()
+        async for raw in stdout:
+            try:
+                obj = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            kind = obj.get("type")
+            if kind == "result":
+                result = obj
+                continue
+            if kind == "rate_limit_event":
+                rate_limit(obj)
+                continue
+            if kind != "stream_event" or not isinstance(obj.get("event"), dict):
+                continue
+            if stopped:
+                return  # a second API call (a continuation): never measured
+            now = time.perf_counter()
+            if sample.startup_s is None:
+                sample.startup_s = now - t0
+            event = parse_event(obj["event"], "anthropic")
+            usage.update(event["usage"])
+            if event["finish"]:
+                sample.finish_reason = event["finish"]
+            if event["stop"]:
+                # first API call complete: the measurement ends here
+                stopped = True
+                sample.e2e_s = now - t0
+                if sample.finish_reason == "length":
+                    # a continuation request follows: take the plan's rate-limit
+                    # event if it is the very next line, then stop the client
+                    with contextlib.suppress(TimeoutError, ValueError):
+                        line = await asyncio.wait_for(stdout.readline(), 0.25)
+                        follow = json.loads(line) if line.strip() else {}
+                        if isinstance(follow, dict) and follow.get("type") == "rate_limit_event":
+                            rate_limit(follow)
+                    return
+                continue  # read on, untimed, for the plan's rate-limit event
+
+            piece, reasoning = event["piece"], event["reasoning"]
+            if not piece and not reasoning:
+                continue
+            size = len(piece) + len(reasoning)
+            if first is None:
+                first = now
+                first_chars = size
+                sample.ttft_s = now - t0
+            elif piece and last is not None:
+                gaps.append(now - last)
+            if piece and sample.first_content_s is None:
+                sample.first_content_s = now - t0
+            last = now
+            sample.chunks += 1
+            chars += size
+            reasoning_chars += len(reasoning)
+
+    try:
+        await asyncio.wait_for(consume(), cfg.timeout_s)
+    except TimeoutError:
+        sample.error = "timeout"
+    except (OSError, ValueError) as exc:  # broken pipe, oversized line
+        sample.error = f"cli_io: {type(exc).__name__}: {exc}"[:300]
+    if sample.e2e_s is None or sample.error:
+        sample.e2e_s = time.perf_counter() - t0
+    if stopped or sample.error:
+        await _stop(proc)  # before any continuation request goes out
+    code = await proc.wait()
+    stderr = (await stderr_task).decode("utf-8", "replace").strip()
+    if sample.error:
+        return sample
+    sample.served_by = target.api
+
+    if not stopped:
+        if result is not None and result.get("is_error"):
+            status = result.get("api_error_status")
+            message = str(result.get("result") or result.get("subtype") or "error")
+            sample.status = status if isinstance(status, int) else None
+            limited = status == 429 or plan_rejected or "rate limit" in message.lower()
+            sample.error = ("rate_limited: " if limited else "cli_error: ") + message[:300]
+        elif plan_rejected:
+            sample.error = "rate_limited: plan limit reached (rate_limit_event: rejected)"
+        elif code != 0:
+            sample.error = f"cli_exit_{code}: {stderr[-300:] or 'no output'}"
+        else:
+            sample.error = "incomplete_stream: ended without message_stop"
+        return sample
+    # what the model actually read: Claude Code sends the prompt with cache
+    # control, so most of it is reported as cache creation/read, not input
+    in_parts = [
+        usage.get(k)
+        for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+    ]
+    if any(isinstance(v, int) for v in in_parts):
+        usage["input_tokens"] = sum(v for v in in_parts if isinstance(v, int))
+    return finish_sample(
+        sample, usage, prompt_text, first, last, gaps, chars, reasoning_chars, first_chars
+    )
+
+
 async def run_target_batch(
     client: httpx.AsyncClient,
     target: Target,
@@ -862,6 +1196,10 @@ async def run_target_batch(
         return samples
 
     async def one() -> Sample:
+        if target.is_cli:
+            return await cli_once(
+                target, prompt_text, prompt_name, max_tokens, cfg, concurrency, batch
+            )
         return await stream_once(
             client,
             target,
@@ -905,7 +1243,7 @@ def mock_sample(
     itl *= 1 + (1 - scaling) * (concurrency - 1)
     ttft *= 1 + 0.04 * (concurrency - 1)
     decode = itl * (tokens - 1)
-    return Sample(
+    sample = Sample(
         target=target.name,
         prompt=prompt_name,
         concurrency=concurrency,
@@ -931,6 +1269,11 @@ def mock_sample(
         wall_clock=now_iso(),
         finish_reason="length" if tokens == max_tokens else "stop",
     )
+    if target.is_cli:
+        # a CLI's TTFT includes its own startup, as real CLI rows report
+        sample.startup_s = min(ttft * 0.8, rng.uniform(*prof.get("startup", (1.5, 2.1))))
+        sample.served_by = target.api
+    return sample
 
 
 # --------------------------------------------------------------------------
@@ -1015,6 +1358,9 @@ def plan_run(cfg: RunConfig, mock: bool = False) -> dict[str, Any]:
             }
         )
     costs = [t["cost_max_usd"] for t in targets if t["cost_max_usd"] is not None]
+    # each CLI request (or concurrent batch) also pays for a process start
+    batches = cfg.warmup + cfg.reps * len(cfg.concurrency) * len(cfg.prompts)
+    cli_seconds = sum(1 for t in cfg.targets if t.is_cli) * batches * PLAN_CLI_STARTUP_S
     return {
         "requests": planned_requests(cfg),
         "measured_requests": measured_per_target * len(cfg.targets),
@@ -1024,11 +1370,12 @@ def plan_run(cfg: RunConfig, mock: bool = False) -> dict[str, Any]:
         "out_tokens_max": out_tokens * len(cfg.targets),
         "cost_max_usd": sum(costs) if costs else None,
         "unpriced": [t["target"] for t in targets if t["cost_max_usd"] is None],
-        "est_minutes": round(seconds * len(cfg.targets) / 60, 1),
+        "est_minutes": round((seconds * len(cfg.targets) + cli_seconds) / 60, 1),
         "assumed": {
             "tok_s": PLAN_TOK_S,
             "ttft_s": PLAN_TTFT_S,
             "template_tokens": PLAN_TEMPLATE_TOKENS,
+            "cli_startup_s": PLAN_CLI_STARTUP_S,
         },
         "targets": targets,
     }
@@ -1057,6 +1404,9 @@ def run_meta(cfg: RunConfig, mock: bool) -> dict[str, Any]:
                 "price_in": t.price_in,
                 "price_out": t.price_out,
                 "api": t.api,
+                "access": "cli" if t.is_cli else "http",
+                "effort": t.effort,  # null = the model's default
+                "plan": t.plan,  # CLI targets: the signed-in plan, when known
                 "temperature": sent_temperature(cfg, t),  # null = not sent
             }
             for t in cfg.targets
@@ -1223,6 +1573,7 @@ def _bucket() -> dict[str, Any]:
         "tpc": [],
         "in": [],
         "out": [],
+        "startup": [],
         "batches": [],
         "ok": 0,
         "n": 0,
@@ -1245,6 +1596,7 @@ _FIELDS = (
     ("tpc", "tokens_per_chunk"),
     ("in", "in_tokens"),
     ("out", "out_tokens"),
+    ("startup", "startup_s"),
 )
 
 # A request whose median chunk gap is under this share of its typical gap got
@@ -1354,6 +1706,8 @@ def bucket_stats(bucket: dict[str, Any]) -> dict[str, Any]:
         "e2e_p50_s": p50(bucket["e2e"]),
         "out_tokens_median": median(bucket["out"]),
         "in_tokens_median": median(bucket["in"]),
+        # CLI targets only: client startup inside TTFT (None for HTTP targets)
+        "startup_p50_s": p50(bucket["startup"]),
         "aggregate_tps": median(bucket["batches"]),
         "ok": bucket["ok"],
         "n": bucket["n"],
@@ -1400,6 +1754,12 @@ def row_notes(st: dict[str, Any]) -> list[str]:
         notes.append(
             f"TTFT includes ~{hidden:.0f} thinking tokens (median) that the API doesn't "
             "stream; tok/s counts only the streamed answer"
+        )
+    startup = st.get("startup_p50_s")
+    if startup is not None:
+        notes.append(
+            f"CLI target: TTFT includes ~{startup:.1f}s of client startup (median, process "
+            "start → first stream event) — don't rank it against HTTP TTFT; tok/s is unaffected"
         )
     if st["bursty"]:
         tpc = st["tokens_per_chunk_median"]
@@ -1455,10 +1815,38 @@ def spend(samples: list[dict[str, Any]], meta: dict[str, Any]) -> dict[str, Any]
         by_level[level] = by_level.get(level, 0.0) + amount
     return {
         "total": sum(by_target.values()) if by_target else None,
+        "plan": plan_usage(samples, meta),
+        # plan-billed: unpriced by nature, not a missing price
+        "plan_targets": sorted(
+            t.get("name") for t in meta.get("targets", []) if t.get("access") == "cli"
+        ),
         "by_target": by_target,
         "by_prompt": by_prompt,
         "by_level": by_level,
         "unpriced": sorted(unpriced),
+    }
+
+
+def plan_usage(samples: list[dict[str, Any]], meta: dict[str, Any]) -> dict[str, Any] | None:
+    """What CLI targets drew from subscription plans: measured requests, and the
+    usage window's utilization before → after as the client reported it (warm-ups
+    included in the window, since they draw on it too). None without CLI targets."""
+    cli = {t.get("name") for t in meta.get("targets", []) if t.get("access") == "cli"}
+    if not cli:
+        return None
+    mine = [s for s in samples if s.get("target") in cli]
+    readings = sorted(
+        (s.get("wall_clock") or "", s["plan_utilization"], s.get("plan_window"))
+        for s in mine
+        if s.get("plan_utilization") is not None
+    )
+    plans = sorted({t.get("plan") for t in meta["targets"] if t.get("name") in cli} - {None})
+    return {
+        "requests": sum(1 for s in mine if s.get("batch") != -1),
+        "plans": plans,
+        "window": readings[-1][2] if readings else None,
+        "utilization_first": readings[0][1] if readings else None,
+        "utilization_last": readings[-1][1] if readings else None,
     }
 
 
@@ -2090,6 +2478,32 @@ def endpoint_toml(
         lines.append(f"api_key_env = {_toml_inline(api_key_env)}")
     if price:
         lines.append("price = " + _toml_inline({"in_per_1m": price[0], "out_per_1m": price[1]}))
+    return "\n".join(lines) + "\n"
+
+
+def cli_target_toml(
+    api: str,
+    model: str,
+    name: str | None = None,
+    effort: str | None = None,
+    source: str = "tps init --api claude-code",
+    run_block: str = DEFAULT_RUN_TOML,
+) -> str:
+    """A one-target config for a CLI target (a subscription plan via its client)."""
+    default = f"{api}/{model}" + (f"@{effort}" if effort else "")
+    lines = [
+        _comment(f"# generated by: {source} --model {model}"),
+        "# add more [[targets]] blocks (other models, effort levels) to compare them",
+        "",
+        run_block,
+        "",
+        "[[targets]]",
+        f"name = {_toml_inline(name or default)}",
+        f"api = {_toml_inline(api)}",
+        f"model = {_toml_inline(model)}",
+    ]
+    if effort:
+        lines.append(f"effort = {_toml_inline(effort)}")
     return "\n".join(lines) + "\n"
 
 

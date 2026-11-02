@@ -391,6 +391,69 @@ def tps(
     )
 
 
+# A stand-in for the `claude` CLI: replays Claude Code's stream-json (Messages
+# API events wrapped in `stream_event`) by model name, and records what tps
+# passed it. No network, no account.
+FAKE_CLAUDE = r"""
+import json, os, sys, time
+args = sys.argv[1:]
+if args[:1] == ["--version"]:
+    print("9.9.9 (Claude Code)"); sys.exit(0)
+if args[:2] == ["auth", "status"]:
+    print(json.dumps({"loggedIn": True, "authMethod": "claude.ai", "subscriptionType": "max",
+                      "email": "someone@example.com"})); sys.exit(0)
+model = args[args.index("--model") + 1]
+prompt = sys.stdin.read()
+with open(os.environ["TPS_FAKE_LOG"], "a") as log:
+    log.write(json.dumps({"model": model, "argv": args, "prompt": prompt,
+                          "env": {k: os.environ.get(k) for k in (
+                              "CLAUDE_CODE_MAX_RETRIES", "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+                              "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")},
+                          "cwd": os.getcwd()}) + "\n")
+def out(obj):
+    print(json.dumps(obj), flush=True)
+def ev(event):
+    out({"type": "stream_event", "event": event})
+out({"type": "system", "subtype": "init", "tools": []})
+if model == "cc-crash":
+    print("boom: something broke", file=sys.stderr); sys.exit(3)
+if model == "cc-ratelimit":
+    out({"type": "result", "subtype": "success", "is_error": True, "api_error_status": 429,
+         "result": "API Error: Request rejected (429)"}); sys.exit(1)
+time.sleep(0.05)  # client startup
+usage = {"input_tokens": 3, "cache_creation_input_tokens": 500, "cache_read_input_tokens": 0}
+def message(n, stop, think=5):
+    ev({"type": "message_start", "message": {"usage": {**usage, "output_tokens": 1}}})
+    time.sleep(0.05)  # hidden thinking, never streamed
+    ev({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}})
+    for _ in range(n):
+        ev({"type": "content_block_delta", "index": 0,
+            "delta": {"type": "text_delta", "text": "word"}})
+        time.sleep(0.01)
+    ev({"type": "message_delta", "delta": {"stop_reason": stop},
+        "usage": {**usage, "output_tokens": n + think,
+                  "output_tokens_details": {"thinking_tokens": think}}})
+    ev({"type": "message_stop"})
+if model == "cc-capped":
+    message(20, "max_tokens")
+    out({"type": "rate_limit_event", "rate_limit_info": {"status": "allowed",
+         "rateLimitType": "five_hour",
+         "unifiedWindows": {"five_hour": {"utilization": 0.5}}}})
+    time.sleep(1.0)
+    # Claude Code would now send a continuation request; tps must be gone by then
+    open(os.environ["TPS_FAKE_LOG"] + ".continued", "w").close()
+    message(20, "max_tokens")
+    out({"type": "result", "is_error": True, "result": "exceeded the output token maximum"})
+    sys.exit(1)
+message(20, "end_turn")
+out({"type": "rate_limit_event", "rate_limit_info": {"status": "allowed",
+     "rateLimitType": "five_hour",
+     "unifiedWindows": {"five_hour": {"utilization": 0.25, "status": "allowed"}}}})
+out({"type": "result", "subtype": "success", "is_error": False,
+     "usage": {**usage, "output_tokens": 25, "output_tokens_details": {"thinking_tokens": 5}}})
+"""
+
+
 def target_block(name: str, base: str, model: str, extra: str = "") -> str:
     return f'[[targets]]\nname = "{name}"\nbase_url = "{base}"\nmodel = "{model}"\n{extra}\n'
 
@@ -2055,6 +2118,313 @@ async def main() -> int:
             and "PARTIAL" in fp_md.read_text(),
             f"{proc.returncode} {len(kept_fp)}",
         )
+
+        print("CLI targets (claude-code, fake client):")
+        fake = work / "fake-claude"
+        fake.write_text(f"#!{sys.executable}\n{FAKE_CLAUDE}", encoding="utf-8")
+        fake.chmod(0o755)
+        fake_log = work / "fake-claude.log"
+        cli_env = {"TPS_FAKE_LOG": str(fake_log), "XDG_CACHE_HOME": str(work / "cache")}
+        saved_env = {k: os.environ.get(k) for k in (*cli_env, "ANTHROPIC_API_KEY")}
+        os.environ.update(cli_env, ANTHROPIC_API_KEY="sk-ant-api-should-be-stripped")
+
+        def cc(model: str, **kw) -> core.Target:
+            return core.Target(
+                name=model, base_url="", model=model, api="claude-code", cli=str(fake), **kw
+            )
+
+        cli_cfg = core.RunConfig(targets=[], prompts={}, reps=1, concurrency=[1], timeout_s=20)
+        try:
+            fast = await core.cli_once(cc("cc-fast", effort="high"), "hi", "p", 512, cli_cfg, 1, 0)
+            check("cli: ok", fast.ok, str(fast.error))
+            check(
+                "cli: tokens from usage",
+                fast.out_tokens == 25 and fast.count_source == "usage",
+                f"{fast.out_tokens} {fast.count_source}",
+            )
+            check(
+                "cli: hidden thinking kept out of tok/s",
+                fast.hidden_reasoning_tokens == 5,
+                str(fast.hidden_reasoning_tokens),
+            )
+            check(
+                "cli: input counts cached prompt tokens", fast.in_tokens == 503, str(fast.in_tokens)
+            )
+            check(
+                "cli: tok/s ~ fake pace (100/s)",
+                fast.out_tps is not None and 50 <= fast.out_tps <= 130,
+                str(fast.out_tps),
+            )
+            check(
+                "cli: startup recorded, inside TTFT",
+                fast.startup_s is not None
+                and fast.ttft_s is not None
+                and 0.04 <= fast.startup_s < fast.ttft_s,
+                f"{fast.startup_s} {fast.ttft_s}",
+            )
+            check(
+                "cli: plan window read after message_stop, outside the timing",
+                fast.plan_utilization == 0.25
+                and fast.plan_window == "five_hour"
+                and fast.e2e_s is not None
+                and fast.e2e_s < 1.0,
+                f"{fast.plan_utilization} {fast.plan_window} {fast.e2e_s}",
+            )
+            check(
+                "cli: served_by names the client",
+                fast.served_by == "claude-code",
+                str(fast.served_by),
+            )
+            logged = [json.loads(line) for line in fake_log.read_text().splitlines()]
+            call = logged[-1]
+            check("cli: prompt sent on stdin", call["prompt"] == "hi", repr(call["prompt"]))
+            check(
+                "cli: --effort passed",
+                "--effort" in call["argv"]
+                and call["argv"][call["argv"].index("--effort") + 1] == "high",
+                str(call["argv"]),
+            )
+            check(
+                "cli: tools and MCP stripped",
+                "--tools" in call["argv"] and "--strict-mcp-config" in call["argv"],
+                str(call["argv"]),
+            )
+            check(
+                "cli: client retries disabled",
+                call["env"]["CLAUDE_CODE_MAX_RETRIES"] == "0",
+                str(call["env"]),
+            )
+            check(
+                "cli: output cap passed",
+                call["env"]["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "512",
+                str(call["env"]),
+            )
+            check(
+                "cli: API key stripped so the plan is measured",
+                call["env"]["ANTHROPIC_API_KEY"] is None,
+                str(call["env"]),
+            )
+            check(
+                "cli: runs in a stable empty workdir",
+                call["cwd"] == str(work / "cache" / "tps" / "cli-workdir"),
+                call["cwd"],
+            )
+
+            capped = await core.cli_once(cc("cc-capped"), "hi", "p", 20, cli_cfg, 1, 0)
+            check(
+                "cli: capped response is a truncated answer, not an error",
+                capped.ok and capped.finish_reason == "length",
+                f"{capped.ok} {capped.error}",
+            )
+            check(
+                "cli: only the first API call is measured",
+                capped.out_tokens == 25,
+                str(capped.out_tokens),
+            )
+            check(
+                "cli: capped response still reports plan usage",
+                capped.plan_utilization == 0.5,
+                str(capped.plan_utilization),
+            )
+            await asyncio.sleep(1.3)
+            check(
+                "cli: stopped before a continuation request",
+                not Path(str(fake_log) + ".continued").exists(),
+            )
+
+            limited = await core.cli_once(cc("cc-ratelimit"), "hi", "p", 64, cli_cfg, 1, 0)
+            check(
+                "cli: 429 → rate_limited, no retry",
+                not limited.ok
+                and (limited.error or "").startswith("rate_limited")
+                and limited.status == 429,
+                str(limited.error),
+            )
+            crash = await core.cli_once(cc("cc-crash"), "hi", "p", 64, cli_cfg, 1, 0)
+            check(
+                "cli: crash → cli_exit_N with stderr",
+                (crash.error or "").startswith("cli_exit_3") and "boom" in (crash.error or ""),
+                str(crash.error),
+            )
+            gone = await core.cli_once(
+                core.Target(
+                    name="g",
+                    base_url="",
+                    model="m",
+                    api="claude-code",
+                    cli=str(work / "no-such-cli"),
+                ),
+                "hi",
+                "p",
+                64,
+                cli_cfg,
+                1,
+                0,
+            )
+            check(
+                "cli: missing binary is an error sample",
+                (gone.error or "").startswith("cli_"),
+                str(gone.error),
+            )
+
+            cc_toml = (
+                '[run]\nreps = 2\nwarmup = 1\nprompts = ["prose-256"]\n\n'
+                f'[[targets]]\nname = "plan"\napi = "claude-code"\nmodel = "cc-fast"\n'
+                f'effort = "low"\ncli = "{fake}"\n'
+            )
+            (work / "cc.toml").write_text(cc_toml, encoding="utf-8")
+            proc = tps(["run", "-c", "cc.toml", "-o", "cc-run", "--json"], work, env_extra=cli_env)
+            out = json.loads(proc.stdout or "{}")
+            row = (out.get("results") or [{}])[0]
+            check(
+                "cli run: exit 0, all ok",
+                proc.returncode == 0 and row.get("ok") == 2,
+                f"{proc.returncode} {proc.stderr[-300:]}",
+            )
+            check("cli run: startup_p50_s reported", row.get("startup_p50_s") is not None, str(row))
+            check(
+                "cli run: notes flag CLI startup in TTFT",
+                any("CLI target" in n for n in row.get("notes", [])),
+                str(row.get("notes")),
+            )
+            check(
+                "cli run: unpriced, not $0",
+                "plan" in out.get("cost_unpriced", []),
+                str(out.get("cost_unpriced")),
+            )
+            meta = json.loads((work / "cc-run" / "meta.json").read_text())
+            check(
+                "cli run: meta records access and effort",
+                meta["targets"][0].get("access") == "cli"
+                and meta["targets"][0].get("effort") == "low",
+                str(meta["targets"][0]),
+            )
+
+            proc = tps(
+                [
+                    "run",
+                    "--api",
+                    "claude-code",
+                    "--model",
+                    "cc-fast",
+                    "--effort",
+                    "max",
+                    "--dry-run",
+                    "--json",
+                ],
+                work,
+                env_extra=cli_env,
+            )
+            plan = json.loads(proc.stdout or "{}")
+            check(
+                "cli dry-run: no URL or key needed",
+                proc.returncode == 0
+                and plan.get("missing_credentials") == []
+                and plan.get("subscription_targets") == ["claude-code/cc-fast@max"],
+                f"{proc.returncode} {proc.stdout[-300:]}",
+            )
+
+            (work / "cc-missing.toml").write_text(
+                cc_toml.replace(str(fake), str(work / "no-such-cli")), encoding="utf-8"
+            )
+            proc = tps(["run", "-c", "cc-missing.toml", "--dry-run", "--json"], work)
+            check(
+                "cli dry-run: missing CLI listed",
+                json.loads(proc.stdout or "{}").get("missing_clis") == ["plan"],
+                proc.stdout,
+            )
+            proc = tps(["run", "-c", "cc-missing.toml", "--json"], work)
+            check(
+                "cli run: missing CLI → exit 1 + JSON error",
+                proc.returncode == 1 and "CLI not installed" in proc.stdout,
+                proc.stdout,
+            )
+
+            for label, extra in (
+                ("api_key_env on a CLI target", 'api_key_env = "X"\n'),
+                ("unknown effort", None),
+            ):
+                text = cc_toml + extra if extra else cc_toml.replace('"low"', '"turbo"')
+                (work / "cc-bad.toml").write_text(text, encoding="utf-8")
+                proc = tps(["run", "-c", "cc-bad.toml", "--dry-run", "--json"], work)
+                check(f"cli config: {label} → exit 1", proc.returncode == 1, proc.stdout)
+            (work / "effort-http.toml").write_text(
+                "[run]\nreps = 1\n\n" + target_block("h", base, "test-model", 'effort = "low"'),
+                encoding="utf-8",
+            )
+            proc = tps(["run", "-c", "effort-http.toml", "--dry-run", "--json"], work)
+            check(
+                "cli config: effort on an HTTP target → exit 1", proc.returncode == 1, proc.stdout
+            )
+
+            proc = tps(["doctor", "-c", "cc.toml", "--json"], work, env_extra=cli_env)
+            doc = json.loads(proc.stdout or "{}")
+            cli_row = next((c for c in doc.get("checks", []) if c["check"].startswith("cli ")), {})
+            check(
+                "doctor: CLI signed in + plan shown",
+                cli_row.get("ok") and "max" in cli_row.get("detail", ""),
+                str(cli_row),
+            )
+            check("doctor: account email never printed", "someone@example.com" not in proc.stdout)
+
+            (work / "mixed.toml").write_text(
+                '[run]\nreps = 2\nwarmup = 0\nprompts = ["prose-256"]\nbaseline = "direct"\n\n'
+                + target_block("direct", base, "atlas", "price = { in_per_1m = 1, out_per_1m = 2 }")
+                + target_block("gw", base, "atlas", "price = { in_per_1m = 1, out_per_1m = 3 }")
+                + '[[targets]]\nname = "plan-low"\napi = "claude-code"\nmodel = "atlas"\n'
+                'effort = "low"\n\n'
+                + '[[targets]]\nname = "plan-high"\napi = "claude-code"\nmodel = "atlas"\n'
+                'effort = "high"\n',
+                encoding="utf-8",
+            )
+            proc = tps(
+                ["run", "-c", "mixed.toml", "--mock", "-o", "mixed-run"],
+                work,
+                env_extra={"COLUMNS": "100"},
+            )
+            screen = proc.stdout + proc.stderr
+            boxes = [line for line in screen.splitlines() if line.startswith("╭─ prose-256")]
+            check(
+                "mixed run: one box per access mode",
+                len(boxes) == 2 and "· API" in boxes[0] and "plan" in boxes[1],
+                str(boxes),
+            )
+            check(
+                "mixed run: boxes share one width",
+                len({len(b) for b in boxes}) == 1,
+                str([len(b) for b in boxes]),
+            )
+            check("mixed run: PLAN badge", "PLAN" in screen.splitlines()[1], screen[:200])
+            check(
+                "mixed run: plan box labels rows by effort, cost column says plan",
+                any(line.startswith("│ effort") for line in screen.splitlines())
+                and any("plan │" in line or " plan " in line for line in screen.splitlines()),
+                screen,
+            )
+            check(
+                "mixed run: snappiest ranks API ttft, plan ttft as an aside",
+                "snappiest" in screen and "on the plan:" in screen,
+                screen,
+            )
+            check(
+                "mixed run: spend line names plan usage",
+                "4 requests on your plan" in screen and "on API" in screen,
+                screen,
+            )
+            check(
+                "mixed run: CLI startup said once (footer), not per row",
+                "CLI startup" in screen and "CLI target:" not in screen,
+                screen,
+            )
+
+            proc = tps(["fingerprint", "-c", "cc.toml", "--json"], work, env_extra=cli_env)
+            check("fingerprint: CLI targets rejected (exit 1)", proc.returncode == 1, proc.stdout)
+        finally:
+            for key, value in saved_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
         print("report provenance:")
         (work / "unknown_rate.toml").write_text(

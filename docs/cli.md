@@ -120,8 +120,11 @@ endpoint directly (with `--api-key-env`, `--name`, `--price` as in `init
 `--max-tokens`, `--temperature`, …), so `-c` repeats it exactly; a different
 `targets.toml` already there is never replaced (pick another `-o`). `--api
 anthropic` speaks the native Claude Messages API instead (URL defaults to
-`https://api.anthropic.com/v1`; takes API keys and Claude subscription tokens) —
-see [configuration](configuration.md#claude-api-anthropic).
+`https://api.anthropic.com/v1`, with an API key) — see
+[configuration](configuration.md#claude-api-anthropic). `--api claude-code --model
+ID [--effort LEVEL]` measures your **Claude subscription** through the signed-in
+`claude` CLI — no URL, key or price — see
+[configuration](configuration.md#claude-subscription-api-claude-code).
 
 Cost model: requests = targets × prompts × reps × Σ(concurrency), plus
 `warmup` per target. A curated 11-target run at 1 prompt, 7 reps, concurrency
