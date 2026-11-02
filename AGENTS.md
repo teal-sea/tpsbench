@@ -49,9 +49,14 @@ with `-c`); the generated config is saved as `<run_dir>/targets.toml` with the
 effective settings (overrides included), and never replaces a different
 `targets.toml` already there (exit 1).
 `--api anthropic` (or `api = "anthropic"` on a target) uses the native Claude
-Messages API — the only Anthropic endpoint that accepts subscription/OAuth
-tokens; it sends no `temperature` (Claude 4.7+ 400s on it) and keeps hidden
-thinking out of tok/s. `discover` and `init --model` are OpenRouter-only;
+Messages API with an API key; it sends no `temperature` (Claude 4.7+ 400s on it)
+and keeps hidden thinking out of tok/s. A Claude **subscription** is measured with
+`--api claude-code --model ID [--effort low|medium|high|xhigh|max]` (or
+`api = "claude-code"`): tps runs the signed-in `claude` CLI headless — no URL,
+key or price. Never extract or replay plan OAuth tokens over HTTP: Anthropic
+answers them with `429 rate_limit_error`, and impersonating its client is not
+something tps does. CLI rows add `startup_p50_s` (client startup inside TTFT —
+don't rank against HTTP TTFT); only the first API call is timed. `discover` and `init --model` are OpenRouter-only;
 everything else is not.
 
 Global: `--json`, `--no-color`, `-q`, `-v`, `--version`. May appear before or
@@ -150,7 +155,16 @@ the stated rate.
 `top_logprobs` (5 if capped; all kept in `fingerprints.jsonl`) and turns
 reasoning off on OpenRouter; a target that spent the budget reasoning anyway is
 `no_data` with `reasoning_consumed_budget`.
-`doctor` adds `checks[]` with `{check, ok, detail, critical}`.
+`doctor` adds `checks[]` with `{check, ok, detail, critical}`; CLI targets add a
+`cli <binary>` check (installed, signed in, plan — never the account email).
+Rows also carry `api`, `access` (`http`|`cli`), `effort` and `plan` (the
+signed-in plan, e.g. `"Max"`, when the CLI reports it); samples in `raw.jsonl`
+carry `plan_utilization`/`plan_window` from the CLI's rate-limit events. The
+terminal shows one box per access mode (CLI TTFT is never ranked against HTTP
+TTFT) and a `PLAN` badge. `run --dry-run` also returns `missing_clis[]` (exit 1 on a real run) and
+`subscription_targets[]` (billed to plan usage, so unpriced). CLI error classes:
+`cli_error`, `cli_exit_N`, `cli_missing`, `cli_io`; `fingerprint` rejects CLI
+targets (exit 1).
 
 Treat `results[].ok/n` as the reliability signal — they count every concurrency
 level; `by_concurrency` shows where failures happened. `errors` is a map of

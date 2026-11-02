@@ -33,9 +33,16 @@ First public release.
   --timeout`) override the config.
 - `finish_reason` and reasoning-token counts are recorded; results carry
   `truncated`, `reasoning_only` and `notes`.
-- Native Claude API targets (`api = "anthropic"`, `--api anthropic`): works with
-  API keys and Claude subscription tokens, which Anthropic's OpenAI-compatible
-  endpoint rejects. `--temperature omit` / `temperature = "omit"`.
+- Native Claude API targets (`api = "anthropic"`, `--api anthropic`) for API keys.
+  `--temperature omit` / `temperature = "omit"`.
+- Claude subscription targets (`api = "claude-code"`, `--api claude-code`, `effort`
+  / `--effort`): measured through the signed-in `claude` CLI, context stripped,
+  client retries off, only the first API call timed; `startup_p50_s` and a note
+  separate CLI startup from TTFT; `doctor` checks the CLI's sign-in and plan.
+- Runs that mix access modes render one box per mode, aligned to a shared width,
+  with a `PLAN` badge, `plan` in the cost column, like-for-like "snappiest", and
+  plan usage (requests, 5-hour window before → after) in the spend line.
+  Provider-only output is unchanged.
 - Fingerprint groundwork for richer comparisons: 20 `top_logprobs` per token (5
   where a provider caps it), every alternative kept in `fingerprints.jsonl`;
   reasoning turned off on OpenRouter; `reasoning_seen` lists targets that

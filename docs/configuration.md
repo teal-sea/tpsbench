@@ -56,11 +56,12 @@ Or with no file: `tps run --api anthropic --model claude-opus-5-5 --api-key-env
 ANTHROPIC_API_KEY` (the URL defaults to Anthropic's).
 
 - **Native, not the OpenAI-compatible layer.** Anthropic also serves
-  `/v1/chat/completions`, but only for API keys; Claude subscription (OAuth)
-  tokens are rejected there. The native API takes both: an `sk-ant-api…` key is
-  sent as `x-api-key`, anything else as a bearer token, and an OAuth token
-  (`sk-ant-oat…`) also gets the `anthropic-beta: oauth-2025-04-20` header it
-  needs.
+  `/v1/chat/completions`. An `sk-ant-api…` key is sent as `x-api-key`, anything
+  else as a bearer token (for gateways that issue their own).
+- **Not for subscription plans.** A Claude Pro/Max OAuth token sent straight to
+  the API is refused (`429 rate_limit_error`, verified 2026-11-01): plan
+  credentials are only honored by Anthropic's own client. Measure a plan with
+  [`api = "claude-code"`](#claude-subscription-api-claude-code) instead.
 - **No `temperature`.** Claude 4.7 and later reject sampling parameters, so it
   isn't sent to `api = "anthropic"` targets unless you set a number explicitly.
   (On the OpenAI-compatible layer they reject `temperature: 0` too — use
@@ -72,6 +73,48 @@ ANTHROPIC_API_KEY` (the URL defaults to Anthropic's).
   thinking — `--max-tokens 2048`.
 - **Fingerprinting** compares whole texts: there are no logprobs and no greedy
   decoding, so Claude normally shows up as `noisy` and can't decide a verdict.
+
+## Claude subscription (`api = "claude-code"`)
+
+```toml
+[[targets]]
+name = "opus-plan-high"
+api = "claude-code"
+model = "claude-opus-5-5"
+effort = "high"            # low | medium | high | xhigh | max; omit = model default
+# cli = "/path/to/claude"  # default: `claude` on PATH
+```
+
+Or with no file: `tps run --api claude-code --model claude-opus-5-5 --effort high`.
+
+tps runs the signed-in `claude` CLI headless (`claude -p --output-format
+stream-json`) — the route Anthropic documents as drawing on plan usage — and
+parses the same Messages API events as `api = "anthropic"`. It never reads,
+stores or replays your plan's OAuth token. `tps doctor` shows whether the CLI is
+installed and signed in, and to which plan.
+
+- **Stripped context.** No tools, MCP servers, skills, settings or CLAUDE.md, a
+  one-line system prompt, in an empty working directory
+  (`~/.cache/tps/cli-workdir`). A configured Claude Code otherwise sends ~245k
+  tokens of setup per call, and you'd be timing that.
+- **The plan, not a key.** `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` are
+  removed from the CLI's environment (`claude -p` would otherwise bill the key).
+  A `claude setup-token` token in `CLAUDE_CODE_OAUTH_TOKEN` is kept.
+- **No retries** (`CLAUDE_CODE_MAX_RETRIES=0`): a 429 or a rejected plan window
+  is recorded as `rate_limited`, like any other target.
+- **One API call per request.** When a response hits the cap, Claude Code
+  silently sends continuation requests. tps stops the CLI at the first
+  `message_stop`, so `max_tokens` is a real per-request cap, `finish_reason:
+  length` counts as `truncated`, and no extra plan usage is spent.
+- **TTFT includes client startup.** `startup_p50_s` is process start → first
+  stream event (~1.5–2 s); the row's notes say so. Compare CLI TTFT with CLI TTFT
+  only. tok/s, ITL and token counts are unaffected.
+- **Unpriced.** Plan usage has no per-token price; rows land in
+  `cost_unpriced`. `fingerprint` doesn't accept CLI targets (no logprobs or
+  sampling control).
+- `api_key`, `api_key_env`, `headers`, `extra_body` and `max_tokens_field` don't
+  apply and are rejected (exit 1). `base_url` is ignored, and no `temperature` is
+  sent (`meta.json` records `temperature: null`).
 
 `[run] temperature` takes a number or `"omit"`. Unset, OpenAI-compatible targets
 get `0` and Claude API targets get nothing; `meta.json` records what each target

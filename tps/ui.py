@@ -36,6 +36,7 @@ BADGES = {
     "warn": "\033[1;30;43m",  # bold black on yellow
     "ok": "\033[1;30;42m",  # bold black on green
     "muted": "\033[1;30;47m",  # bold black on grey
+    "plan": "\033[1;30;45m",  # bold black on magenta: measured on a subscription
 }
 
 # one colour per fingerprint cluster, cycled
@@ -177,7 +178,9 @@ class UI:
         if not self.silent:
             print(text)
 
-    def header(self, command: str, detail: str = "", mock: bool = False) -> None:
+    def header(
+        self, command: str, detail: str = "", mock: bool = False, plan: bool = False
+    ) -> None:
         """` tps  run ` badge line that opens every command's output."""
         if self.silent:
             return
@@ -185,6 +188,8 @@ class UI:
         line = f"{badge} {self.bold(command)}"
         if mock:
             line += "  " + self.badge("MOCK DATA", "warn")
+        if plan:
+            line += "  " + self.badge("PLAN", "plan")
         if detail:
             line += "  " + self.grey(detail)
         print()
@@ -225,13 +230,17 @@ class UI:
         rows: Sequence[Sequence[Cell]],
         title: str = "",
         footer: str = "",
-    ) -> None:
+        min_inner: int = 0,
+        measure: bool = False,
+    ) -> int:
         """Rounded box, title in the top border, columns padded on plain text.
 
         Styling is applied after padding, so colour never disturbs alignment.
+        Returns the inner width; `measure` returns it without printing, so
+        boxes shown together can share one width (`min_inner`).
         """
-        if self.silent:
-            return
+        if self.silent and not measure:
+            return 0
 
         def plain(cell: Cell) -> str:
             if isinstance(cell, Bar):
@@ -264,6 +273,9 @@ class UI:
             widths = [widths[i] for i in keep]
             rows = [[row[i] if i < len(row) else "" for i in keep] for row in rows]
         inner = max(inner, len(title) + 3, min(len(footer), self.width - 4))
+        inner = max(inner, min(min_inner, self.width - 4))
+        if measure:
+            return inner
 
         def fit(text: str, width: int) -> str:
             return text if len(text) <= width else text[: max(0, width - 1)] + "…"
@@ -305,6 +317,7 @@ class UI:
             print(self.grey("├" + "─" * (inner + 2) + "┤"))
             print(f"{self.grey('│')} {self.grey(fit(footer, inner).ljust(inner))} {self.grey('│')}")
         print(self.grey("╰" + "─" * (inner + 2) + "╯"))
+        return inner
 
     # -- heatmap ---------------------------------------------------------
     def heat(self, value: float | None, diagonal: bool = False) -> str:
