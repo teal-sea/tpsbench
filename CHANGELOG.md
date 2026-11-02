@@ -39,6 +39,10 @@ First public release.
   / `--effort`): measured through the signed-in `claude` CLI, context stripped,
   client retries off, only the first API call timed; `startup_p50_s` and a note
   separate CLI startup from TTFT; `doctor` checks the CLI's sign-in and plan.
+- `effort` on every target, in each API's own request shape; `[[grids]]` and
+  comma lists in `--model`/`--effort` measure every model × effort level. Grids
+  render as a `tok/s · ttft by effort` matrix, or rows by effort plus a "what
+  effort costs" box, with a takeaway only when it holds for every model.
 - Runs that mix access modes render one box per mode, aligned to a shared width,
   with a `PLAN` badge, `plan` in the cost column, like-for-like "snappiest", and
   plan usage (requests, 5-hour window before → after) in the spend line.

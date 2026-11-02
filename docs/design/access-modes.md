@@ -1,6 +1,6 @@
 # Design: access modes, model × effort grids, and a guided TUI
 
-Status: **proposal** (2026-11-01). Step 1 (`api = "claude-code"`) is implemented on `feat/subscription-backends`.
+Status: **in progress** (2026-11-02). Step 1 (`api = "claude-code"`) is in PR #6; step 2 (effort + grids) on `feat/effort-grids`.
 
 ## Problem
 

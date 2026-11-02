@@ -51,7 +51,7 @@ effective settings (overrides included), and never replaces a different
 `--api anthropic` (or `api = "anthropic"` on a target) uses the native Claude
 Messages API with an API key; it sends no `temperature` (Claude 4.7+ 400s on it)
 and keeps hidden thinking out of tok/s. A Claude **subscription** is measured with
-`--api claude-code --model ID [--effort low|medium|high|xhigh|max]` (or
+`--api claude-code --model ID[,ID] [--effort low,high]` (or
 `api = "claude-code"`): tps runs the signed-in `claude` CLI headless — no URL,
 key or price. Never extract or replay plan OAuth tokens over HTTP: Anthropic
 answers them with `429 rate_limit_error`, and impersonating its client is not
@@ -157,7 +157,10 @@ reasoning off on OpenRouter; a target that spent the budget reasoning anyway is
 `no_data` with `reasoning_consumed_budget`.
 `doctor` adds `checks[]` with `{check, ok, detail, critical}`; CLI targets add a
 `cli <binary>` check (installed, signed in, plan — never the account email).
-Rows also carry `api`, `access` (`http`|`cli`), `effort` and `plan` (the
+`effort` works on every target (Claude API `output_config.effort`, OpenRouter
+`reasoning.effort`, else `reasoning_effort`); `[[grids]]` (or comma lists in
+`--model`/`--effort`) expand to one target per model × effort, named
+`<grid>/<model>@<effort>`. Rows also carry `api`, `access` (`http`|`cli`), `effort` and `plan` (the
 signed-in plan, e.g. `"Max"`, when the CLI reports it); samples in `raw.jsonl`
 carry `plan_utilization`/`plan_window` from the CLI's rate-limit events. The
 terminal shows one box per access mode (CLI TTFT is never ranked against HTTP

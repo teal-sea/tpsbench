@@ -77,6 +77,15 @@ CLI_APIS = ("claude-code",)
 APIS = ("openai", "anthropic", *CLI_APIS)
 CLI_DEFAULT_BINARY = {"claude-code": "claude"}
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
+# HTTP APIs: what each provider accepts varies by model (OpenAI also has
+# "minimal"); an unsupported level is the provider's 400, recorded as data
+EFFORTS_HTTP = ("minimal", *EFFORTS)
+# where effort goes in each API's request body; extra_body may not also set it
+EFFORT_FIELDS = {
+    "anthropic": "output_config",
+    "openrouter": "reasoning",
+    "openai": "reasoning_effort",
+}
 # credentials a child `claude` would prefer over the signed-in plan (`-p` uses an
 # API key whenever one is set); dropped so `claude-code` measures the plan
 CLAUDE_CODE_STRIP_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
@@ -226,7 +235,7 @@ class Target:
     # "openai" = /chat/completions; "anthropic" = the native Claude Messages
     # API, the only one that accepts Claude subscription (OAuth) tokens
     api: str = "openai"
-    # reasoning effort; None = the model's default. CLI targets only for now.
+    # reasoning effort; None = the model's default (sent as nothing at all)
     effort: str | None = None
     # CLI targets: the executable to spawn (default: `claude` for claude-code)
     cli: str | None = None
@@ -246,6 +255,26 @@ class Target:
         if os.sep in binary:
             return binary if os.access(binary, os.X_OK) else None
         return shutil.which(binary)
+
+    def effort_field(self) -> str | None:
+        """The request field that carries `effort`; None for CLI targets."""
+        if self.is_cli:
+            return None
+        if self.api == "anthropic":
+            return EFFORT_FIELDS["anthropic"]
+        host = urlparse(self.base_url).hostname or ""
+        return EFFORT_FIELDS["openrouter" if host.endswith("openrouter.ai") else "openai"]
+
+    def effort_body(self) -> dict[str, Any]:
+        """`effort` in this API's own shape, or {} for the model's default."""
+        field_name = self.effort_field()
+        if not self.effort or not field_name:
+            return {}
+        if field_name == "output_config":
+            return {"output_config": {"effort": self.effort}}
+        if field_name == "reasoning":
+            return {"reasoning": {"effort": self.effort}}
+        return {"reasoning_effort": self.effort}
 
     def url(self) -> str:
         base = self.base_url.rstrip("/")
@@ -410,6 +439,48 @@ def _price(value: Any, key: str, label: str, path: Path) -> float | None:
     return number
 
 
+GRID_ONLY = ("models", "effort", "prices")
+
+
+def expand_grids(grids: list[dict[str, Any]], path: Path) -> list[dict[str, Any]]:
+    """`[[grids]]` → one target per model × effort, interleaved like any other.
+
+    Every other key (api, base_url, api_key_env, price, cli, extra_body, …) is
+    shared by the grid's targets; `prices` overrides `price` per model.
+    `effort = ["default", "high"]` includes the model's own default.
+    """
+    out: list[dict[str, Any]] = []
+    for index, grid in enumerate(grids, start=1):
+        if not isinstance(grid, dict):
+            raise UsageError(f"{path}: [[grids]] #{index} must be a table")
+        name = grid.get("name")
+        if not name:
+            raise UsageError(f"{path}: [[grids]] #{index} is missing `name` (the targets' prefix)")
+        models = grid.get("models", grid.get("model"))
+        models = [models] if isinstance(models, str) else list(models or [])
+        efforts = grid.get("effort")
+        efforts = [efforts] if efforts is None or isinstance(efforts, str) else list(efforts)
+        if not models or not efforts or not all(isinstance(m, str) and m for m in models):
+            raise UsageError(
+                f"{path}: grid {name!r}: `models` and `effort` need at least one value"
+            )
+        if len(set(models)) < len(models) or len(set(map(str, efforts))) < len(efforts):
+            raise UsageError(f"{path}: grid {name!r}: `models` and `effort` must not repeat")
+        prices = grid.get("prices") or {}
+        if not isinstance(prices, dict) or any(m not in models for m in prices):
+            raise UsageError(f"{path}: grid {name!r}: `prices` keys must be models in the grid")
+        shared = {k: v for k, v in grid.items() if k not in (*GRID_ONLY, "name", "model")}
+        for model in models:
+            for effort in efforts:
+                level = None if effort in (None, "default") else str(effort)
+                entry = dict(shared, model=model, effort=level)
+                entry["name"] = f"{name}/{model}" + (f"@{level}" if level else "")
+                if model in prices:
+                    entry["price"] = prices[model]
+                out.append(entry)
+    return out
+
+
 def load_config(path: Path) -> RunConfig:
     try:
         with open(path, "rb") as handle:
@@ -430,9 +501,9 @@ def config_from_text(text: str, label: str) -> RunConfig:
 
 def config_from_dict(raw: dict[str, Any], path: Path) -> RunConfig:
     run = raw.get("run", {}) or {}
-    target_dicts = raw.get("targets") or []
+    target_dicts = list(raw.get("targets") or []) + expand_grids(raw.get("grids") or [], path)
     if not target_dicts:
-        raise UsageError(f"{path}: no [[targets]] defined")
+        raise UsageError(f"{path}: no [[targets]] or [[grids]] defined")
 
     targets: list[Target] = []
     for index, entry in enumerate(target_dicts, start=1):
@@ -448,13 +519,9 @@ def config_from_dict(raw: dict[str, Any], path: Path) -> RunConfig:
         effort = entry.get("effort")
         if effort is not None:
             effort = str(effort).lower()
-            if api not in CLI_APIS:
-                raise UsageError(
-                    f"{path}: {label}: `effort` is only supported on CLI targets "
-                    f"({', '.join(CLI_APIS)}) so far"
-                )
-            if effort not in EFFORTS:
-                raise UsageError(f"{path}: {label}: `effort` must be one of {', '.join(EFFORTS)}")
+            allowed = EFFORTS if api in CLI_APIS else EFFORTS_HTTP
+            if effort not in allowed:
+                raise UsageError(f"{path}: {label}: `effort` must be one of {', '.join(allowed)}")
         if api in CLI_APIS:
             unsupported = sorted(
                 k
@@ -479,6 +546,12 @@ def config_from_dict(raw: dict[str, Any], path: Path) -> RunConfig:
                 f"{path}: {label}: extra_body can't set {', '.join(reserved)} — tps sends "
                 "those itself (token caps: a prompt's max_tokens, --max-tokens, or "
                 "max_tokens_field for the field name)"
+            )
+        clash = sorted(k for k in extra_body if k in EFFORT_FIELDS.values())
+        if effort and clash:
+            raise UsageError(
+                f"{path}: {label}: `effort` and extra_body.{clash[0]} both set reasoning "
+                "effort — keep one (`effort` is sent in each API's own format)"
             )
         targets.append(
             Target(
@@ -881,6 +954,8 @@ def request_body(
         body["max_tokens"] = max_tokens
     else:
         body[target.max_tokens_field or cfg.max_tokens_field] = max_tokens
+    # effort before `extra`: fingerprint turns reasoning off on top of it
+    body.update(target.effort_body())
     body.update(extra or {})
     # extra_body last: it is how provider pinning / vendor flags get applied
     body.update(target.extra_body)
@@ -1242,6 +1317,10 @@ def mock_sample(
     scaling = float(prof.get("scaling", 0.94))
     itl *= 1 + (1 - scaling) * (concurrency - 1)
     ttft *= 1 + 0.04 * (concurrency - 1)
+    # higher effort thinks longer before the first visible token (hidden)
+    level = EFFORTS_HTTP.index(target.effort) if target.effort in EFFORTS_HTTP else None
+    thinking = round(30 * 2.2**level * rng.uniform(0.85, 1.15)) if level is not None else 0
+    ttft += thinking * itl * 0.9
     decode = itl * (tokens - 1)
     sample = Sample(
         target=target.name,
@@ -1269,6 +1348,8 @@ def mock_sample(
         wall_clock=now_iso(),
         finish_reason="length" if tokens == max_tokens else "stop",
     )
+    if thinking:
+        sample.reasoning_tokens = sample.hidden_reasoning_tokens = thinking
     if target.is_cli:
         # a CLI's TTFT includes its own startup, as real CLI rows report
         sample.startup_s = min(ttft * 0.8, rng.uniform(*prof.get("startup", (1.5, 2.1))))
@@ -2442,13 +2523,14 @@ DEFAULT_RUN_TOML = '[run]\nreps = 7\nconcurrency = [1]\nprompts = ["prose-256"]'
 
 def endpoint_toml(
     base_url: str,
-    model: str,
+    model: str | list[str],
     name: str | None = None,
     api_key_env: str | None = None,
     price: tuple[float, float] | None = None,
     source: str = "tps init --endpoint",
     api: str = "openai",
     run_block: str = DEFAULT_RUN_TOML,
+    effort: str | list[str] | None = None,
 ) -> str:
     """A one-target config for any OpenAI-compatible endpoint, no gateway needed.
 
@@ -2461,49 +2543,72 @@ def endpoint_toml(
         raise UsageError(f"not an http(s) URL: {base_url!r} — e.g. https://api.example.com/v1")
     # never the netloc: a user:password@ in the URL must not become the name
     default_name = parsed.hostname + (f":{parsed.port}" if parsed.port else "")
+    models = _as_list(model)
+    fields: list[tuple[str, Any]] = [("base_url", base_url)]
+    if api != "openai":
+        fields.append(("api", api))
+    if api_key_env:
+        fields.append(("api_key_env", api_key_env))
+    if price:
+        fields.append(("price", {"in_per_1m": price[0], "out_per_1m": price[1]}))
     lines = [
-        _comment(f"# generated by: {source} {redact_url(base_url)} --model {model}"),
-        "# add more [[targets]] blocks to compare providers side by side",
+        _comment(f"# generated by: {source} {redact_url(base_url)} --model {','.join(models)}"),
+        "# add more blocks to compare providers side by side",
         "",
         run_block,
         "",
-        "[[targets]]",
-        f"name = {_toml_inline(name or default_name)}",
-        f"base_url = {_toml_inline(base_url)}",
-        f"model = {_toml_inline(model)}",
+        *target_block(name or default_name, fields, models, _as_list(effort)),
     ]
-    if api != "openai":
-        lines.append(f"api = {_toml_inline(api)}")
-    if api_key_env:
-        lines.append(f"api_key_env = {_toml_inline(api_key_env)}")
-    if price:
-        lines.append("price = " + _toml_inline({"in_per_1m": price[0], "out_per_1m": price[1]}))
     return "\n".join(lines) + "\n"
+
+
+def _as_list(value: str | list[str] | None) -> list[str]:
+    if value is None:
+        return []
+    return [value] if isinstance(value, str) else list(value)
+
+
+def target_block(
+    name: str, fields: list[tuple[str, Any]], models: list[str], efforts: list[str]
+) -> list[str]:
+    """One [[targets]] block — or a [[grids]] block when several models or
+    effort levels are asked for (each combination becomes its own target)."""
+    if len(models) == 1 and len(efforts) <= 1:
+        lines = ["[[targets]]", f"name = {_toml_inline(name)}"]
+        lines += [f"{k} = {_toml_inline(v)}" for k, v in fields]
+        lines.append(f"model = {_toml_inline(models[0])}")
+        if efforts and efforts[0] != "default":
+            lines.append(f"effort = {_toml_inline(efforts[0])}")
+        return lines
+    lines = ["[[grids]]  # one target per model × effort level", f"name = {_toml_inline(name)}"]
+    lines += [f"{k} = {_toml_inline(v)}" for k, v in fields]
+    lines.append(f"models = {_toml_inline(models)}")
+    lines.append(f"effort = {_toml_inline(efforts or ['default'])}")
+    return lines
 
 
 def cli_target_toml(
     api: str,
-    model: str,
+    model: str | list[str],
     name: str | None = None,
-    effort: str | None = None,
+    effort: str | list[str] | None = None,
     source: str = "tps init --api claude-code",
     run_block: str = DEFAULT_RUN_TOML,
 ) -> str:
-    """A one-target config for a CLI target (a subscription plan via its client)."""
-    default = f"{api}/{model}" + (f"@{effort}" if effort else "")
+    """A config for a CLI target (a subscription plan via its client): one
+    target, or a grid when several models or effort levels are given."""
+    models, efforts = _as_list(model), _as_list(effort)
+    single = len(models) == 1 and len(efforts) <= 1
+    level = efforts[0] if efforts and efforts[0] != "default" else None
+    default = f"{api}/{models[0]}" + (f"@{level}" if level else "") if single else api
     lines = [
-        _comment(f"# generated by: {source} --model {model}"),
-        "# add more [[targets]] blocks (other models, effort levels) to compare them",
+        _comment(f"# generated by: {source} --model {','.join(models)}"),
+        "# add more blocks (other models, effort levels) to compare them",
         "",
         run_block,
         "",
-        "[[targets]]",
-        f"name = {_toml_inline(name or default)}",
-        f"api = {_toml_inline(api)}",
-        f"model = {_toml_inline(model)}",
+        *target_block(name or default, [("api", api)], models, efforts),
     ]
-    if effort:
-        lines.append(f"effort = {_toml_inline(effort)}")
     return "\n".join(lines) + "\n"
 
 

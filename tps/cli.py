@@ -223,7 +223,8 @@ def endpoint_config(
     extras = {"--api-key-env": args.api_key_env, "--name": args.name, "--price": args.price}
     if flag == "--base-url":
         extras["--model"] = args.model
-    effort = getattr(args, "effort", None)
+    effort = _effort_list(getattr(args, "effort", None), args.api)
+    models = [m.strip() for m in (args.model or "").split(",") if m.strip()]
     if args.api in core.CLI_APIS:
         # a CLI target has no URL, key or price: the vendor's client signs in
         stray = [n for n, v in extras.items() if v is not None and n not in ("--name", "--model")]
@@ -235,14 +236,14 @@ def endpoint_config(
             raise core.UsageError(f"--api {args.api} needs --model, e.g. claude-opus-5-5")
         return core.cli_target_toml(
             args.api,
-            args.model,
+            models,
             args.name,
             effort,
             source=f"tps {args.command} --api {args.api}",
             run_block=run_block,
         )
-    if effort is not None:
-        raise core.UsageError(f"--effort only applies to --api {'/'.join(core.CLI_APIS)} so far")
+    if effort and url is None and args.api is None:
+        raise core.UsageError(f"--effort needs {flag} or --api (or set `effort` in a config)")
     if url is None and args.api == "anthropic":
         url = CLAUDE_API_URL  # `--api anthropic` alone means Anthropic's own endpoint
     elif url is None and args.api is not None:
@@ -257,14 +258,29 @@ def endpoint_config(
         raise core.UsageError(f"{flag} needs --model — the model id that endpoint serves")
     return core.endpoint_toml(
         url,
-        args.model,
+        models,
         args.name,
         args.api_key_env,
         _price_pair(args.price),
         source=f"tps {args.command} {flag}",
         api=args.api or "openai",
         run_block=run_block,
+        effort=effort,
     )
+
+
+def _effort_list(text: str | None, api: str | None) -> list[str] | None:
+    """`--effort low,high` → ["low", "high"]; "default" means the model's own."""
+    if text is None:
+        return None
+    levels = [e.strip().lower() for e in text.split(",") if e.strip()]
+    allowed = core.EFFORTS if api in core.CLI_APIS else core.EFFORTS_HTTP
+    bad = [e for e in levels if e not in (*allowed, "default")]
+    if not levels or bad:
+        raise core.UsageError(
+            f"--effort takes a comma list of {', '.join(allowed)} or default — got {text!r}"
+        )
+    return levels
 
 
 def check_mock(cfg: core.RunConfig, path: Path, mock: bool, ui: UI) -> None:
@@ -432,7 +448,7 @@ def print_run_table(ui: UI, summary: dict[str, Any], prompt: str) -> None:
     # a shared first-column width lines the columns up from box to box
     label_w = max(len(x) for g in groups for x in [_row_labels(g)[0], *_row_labels(g)[1]])
     bar_w, width = 24, 0
-    if len(groups) > 1:
+    if len(groups) > 1 and not any(_is_matrix(g) for g in groups):
         # boxes shown together share one width and one bar width, so their
         # columns line up: size the bars so the widest box needs no shrinking
         args = (summary["baseline"], prompt, conc, peak, True, label_w, bar_w)
@@ -443,7 +459,133 @@ def print_run_table(ui: UI, summary: dict[str, Any], prompt: str) -> None:
         width = natural - (24 - bar_w)
     args = (summary["baseline"], prompt, conc, peak, len(groups) > 1, label_w, bar_w)
     for group in groups:
-        _run_box(ui, group, *args, min_inner=width)
+        if _is_matrix(group):
+            inner = _effort_matrix(ui, group, prompt)
+        else:
+            inner = _run_box(ui, group, *args, min_inner=width)
+        if len({r.get("model") for r in group}) == 1 and len(_efforts(group)) > 1:
+            _effort_cost(ui, group, min_inner=inner)
+        if line := effort_takeaway(group):
+            ui.say()
+            ui.say(f"  {ui.cyan('→')} {line}")
+
+
+def _effort_rank(effort: str | None) -> int:
+    """`default` (None) first, then low → max."""
+    return -1 if effort is None else core.EFFORTS_HTTP.index(effort)
+
+
+def _efforts(rows: list[dict[str, Any]]) -> list[str | None]:
+    return sorted({r.get("effort") for r in rows}, key=_effort_rank)
+
+
+def _is_matrix(rows: list[dict[str, Any]]) -> bool:
+    """Several models × several effort levels: a matrix reads better than rows."""
+    return len({r.get("model") for r in rows}) > 1 and len(_efforts(rows)) > 1
+
+
+def _effort_matrix(ui: UI, rows: list[dict[str, Any]], prompt: str) -> int:
+    efforts = _efforts(rows)
+    models = list(dict.fromkeys(r.get("model") for r in rows))
+    cell = {(r.get("model"), r.get("effort")): r for r in rows}
+    rated = [r["out_tps_p50"] for r in rows if r["out_tps_p50"] and not _thinking(r)]
+    best = max(rated) if len(rated) > 1 else None
+    table = []
+    for model in models:
+        line: list[Any] = [model]
+        for effort in efforts:
+            r = cell.get((model, effort))
+            if r is None:
+                line.append(("—", ui.grey))
+            elif not r["ok"]:
+                line.append(("failed", ui.red))
+            elif r["out_tps_p50"] is None or r["ttft_p50_s"] is None:
+                line.append(("no answer", ui.yellow))
+            else:
+                text = f"{r['out_tps_p50']:.1f} · {r['ttft_p50_s']:.1f}s"
+                if r["ok"] < r["n"]:
+                    line.append((text + " !", ui.yellow))
+                else:
+                    line.append((text, ui.best if r["out_tps_p50"] == best else None))
+        table.append(line)
+    cli = rows[0].get("access") == "cli"
+    title = f"{prompt} · tok/s · ttft by effort" + (f" · {plan_title(rows)}" if cli else "")
+    footer = "p50 · green = fastest tok/s"
+    if any(0 < r["ok"] < r["n"] for r in rows):
+        footer += " · ! = some requests failed"
+    if cli:
+        startup = core.median([r.get("startup_p50_s") for r in rows])
+        footer += " · ttft incl. " + (f"~{startup:.1f}s " if startup else "") + "CLI startup"
+    ui.say()
+    return ui.table(
+        [Col("model", "l")] + [Col(e or "default") for e in efforts],
+        table,
+        title=title,
+        footer=footer,
+    )
+
+
+def _effort_cost(ui: UI, rows: list[dict[str, Any]], min_inner: int = 0) -> None:
+    """One model across effort levels: how TTFT and thinking grow."""
+    ordered = sorted(rows, key=lambda r: _effort_rank(r.get("effort")))
+    timed = [r for r in ordered if r["ttft_p50_s"] is not None]
+    if len(timed) < 2:
+        return
+    peak = max(r["ttft_p50_s"] for r in timed)
+    table = []
+    for r in timed:
+        thinking = r.get("hidden_reasoning_tokens_median")
+        table.append(
+            [
+                r.get("effort") or "default",
+                _secs(r["ttft_p50_s"]),
+                Bar(r["ttft_p50_s"], peak, 30, ui.magenta),
+                f"~{thinking:.0f} tok" if thinking else "—",
+            ]
+        )
+    ui.say()
+    ui.table(
+        [Col("effort", "l"), Col("ttft"), Col("", "l", flex=True), Col("thinking")],
+        table,
+        title=f"{rows[0].get('model')} · what effort costs",
+        footer="thinking tokens are generated, unseen, before the first visible token",
+        min_inner=min_inner,
+    )
+
+
+def effort_takeaway(rows: list[dict[str, Any]]) -> str | None:
+    """One sentence about effort, only when it holds for every model measured:
+    tok/s stays flat, and/or TTFT rises with each level."""
+    by_model: dict[str, list[dict[str, Any]]] = {}
+    for r in rows:
+        if r["out_tps_p50"] is not None and r["ttft_p50_s"] is not None and not _thinking(r):
+            by_model.setdefault(r.get("model"), []).append(r)
+    series = [
+        sorted(rs, key=lambda r: _effort_rank(r.get("effort")))
+        for rs in by_model.values()
+        if len({r.get("effort") for r in rs}) > 1
+    ]
+    if not series:
+        return None
+    clauses = []
+    spreads = [
+        (max(r["out_tps_p50"] for r in s) - min(r["out_tps_p50"] for r in s))
+        / max(r["out_tps_p50"] for r in s)
+        for s in series
+    ]
+    if max(spreads) < 0.05:
+        clauses.append(f"effort barely moves tok/s (≤{max(spreads):.0%})")
+    rising = all(
+        all(b["ttft_p50_s"] >= a["ttft_p50_s"] for a, b in zip(s, s[1:], strict=False))
+        for s in series
+    )
+    if rising:
+        worst = max(series, key=lambda s: s[-1]["ttft_p50_s"] - s[0]["ttft_p50_s"])
+        delta = worst[-1]["ttft_p50_s"] - worst[0]["ttft_p50_s"]
+        low, high = (worst[0].get("effort") or "default"), (worst[-1].get("effort") or "default")
+        where = f" on {worst[0].get('model')}" if len(series) > 1 else ""
+        clauses.append(f"it costs ttft: +{delta:.1f}s from {low} to {high}{where}")
+    return " · ".join(clauses) or None
 
 
 def _by_access(rows: list[dict[str, Any]], access: str) -> list[dict[str, Any]]:
@@ -454,7 +596,16 @@ def _row_labels(rows: list[dict[str, Any]]) -> tuple[str, list[str]]:
     """The first column: provider names for HTTP rows; for CLI rows, whichever of
     model and effort varies (shared values are in the box title instead)."""
     if rows[0].get("access", "http") != "cli":
-        return "provider", [r["target"] for r in rows]
+        if len({r.get("model") for r in rows}) == 1 and len({r.get("effort") for r in rows}) == 1:
+            return "provider", [r["target"] for r in rows]
+        # a grid: name rows by what varies, as for CLI rows
+        parts = {
+            "provider": lambda r: r["target"].split("/")[0],
+            "model": lambda r: r.get("model"),
+            "effort": lambda r: r.get("effort") or "default",
+        }
+        vary = [k for k, get in parts.items() if len({get(r) for r in rows}) > 1]
+        return " · ".join(vary), [" · ".join(str(parts[k](r)) for k in vary) for r in rows]
     vary = [k for k in ("model", "effort") if len({r.get(k) for r in rows}) > 1]
     if not vary:
         if len({r.get("api") for r in rows}) == len(rows):
@@ -561,8 +712,13 @@ def _run_box(
         startup = core.median([r.get("startup_p50_s") for r in rows])
         legend = "p50 · ttft incl. " + (f"~{startup:.1f}s " if startup else "")
         legend += "CLI startup — compare within this box · tok/s decode rate"
-    elif mixed:
-        title += " · API"
+    else:
+        title += " · API" if mixed else ""
+        if _row_labels(rows)[0] not in ("provider", "target"):
+            if _shared(rows, "model"):
+                title += f" · {rows[0]['model']}"
+            if _shared(rows, "effort"):
+                title += f" · effort {rows[0]['effort']}"
     if estimated:
         legend += " · ≈ chars/4 estimate"
     if any(r["bursty"] for r in rows):
@@ -575,6 +731,8 @@ def _run_box(
         for note in r["notes"]:
             if cli and note.startswith("CLI target:"):
                 continue  # the box's footer says it once
+            if note.startswith("TTFT includes ~") and len(_efforts(rows)) > 1:
+                continue  # the "what effort costs" box shows thinking per level
             first, *rest = _wrap(f"{r['target']}: {note}", ui.width - 6)
             ui.warn(first)
             for line in rest:
@@ -634,13 +792,20 @@ def print_load_table(ui: UI, summary: dict[str, Any], prompt: str) -> None:
 
 
 def _display_names(rows: list[dict[str, Any]]) -> dict[str, str]:
-    """What callouts call each row: the box's own label, "plan · low" for CLI rows."""
+    """What callouts call each row: the box's own label ("plan · low" for CLI
+    rows), so a name in a callout matches a row in a box."""
     names = {r["target"]: r["target"] for r in rows}
-    cli = [r for r in rows if r.get("access") == "cli"]
-    if cli:
-        header, labels = _row_labels(cli)
-        if header != "target":
-            names.update({r["target"]: f"plan · {lab}" for r, lab in zip(cli, labels, strict=True)})
+    for access in ("http", "cli"):
+        group = _by_access(rows, access)
+        if not group:
+            continue
+        header, labels = _row_labels(group)
+        if header in ("target", "provider"):
+            continue
+        prefix = "plan · " if access == "cli" else ""
+        if header == "effort":
+            labels = [f"effort {lab}" for lab in labels]
+        names.update({r["target"]: prefix + lab for r, lab in zip(group, labels, strict=True)})
     return names
 
 
@@ -672,7 +837,7 @@ def print_rankings(ui: UI, summary: dict[str, Any], prompt: str) -> None:
             )
         lines.append(("●", "snappiest", name[snappiest["target"]], detail))
     priced = [r for r in rows if r["price_out_per_1m"] is not None]
-    if priced:
+    if len({r["price_out_per_1m"] for r in priced}) > 1:
         cheapest = min(priced, key=lambda r: r["price_out_per_1m"])
         lines.append(
             (
@@ -1461,7 +1626,7 @@ def build_parser() -> argparse.ArgumentParser:
             "--model",
             default=None,
             help=(
-                "model id at that endpoint"
+                "model id at that endpoint (a comma list compares several)"
                 if flag == "--base-url"
                 else f"with {flag}: the model id there; alone: OpenRouter slug to discover"
             ),
@@ -1476,9 +1641,10 @@ def build_parser() -> argparse.ArgumentParser:
         )
         p.add_argument(
             "--effort",
-            choices=core.EFFORTS,
             default=None,
-            help="reasoning effort (CLI targets); default: the model's own",
+            metavar="LEVELS",
+            help="reasoning effort, e.g. high or low,high (a grid: one target per "
+            "model × level); default = the model's own",
         )
         p.add_argument("--api-key-env", default=None, help="env var holding the key")
         p.add_argument("--name", default=None, help="target name (default: the host)")

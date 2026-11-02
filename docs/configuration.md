@@ -24,7 +24,8 @@ A config is TOML with one `[run]` table and any number of `[[targets]]` tables.
 | `name` | yes | shows up in reports; must be unique (every statistic is keyed by it) — keep it stable across runs |
 | `base_url` | yes | API root; `/chat/completions` is appended (`/messages` with `api = "anthropic"`) |
 | `model` | yes | provider's model id, not your alias |
-| `api` | no | `"openai"` (default, any OpenAI-compatible server) or `"anthropic"` (the native Claude API — see below) |
+| `api` | no | `"openai"` (default, any OpenAI-compatible server), `"anthropic"` (the native Claude API) or `"claude-code"` (a Claude plan via the `claude` CLI) — see below |
+| `effort` | no | reasoning effort, sent in each API's own format: `output_config.effort` (Claude API), `reasoning.effort` (OpenRouter), `reasoning_effort` (other OpenAI-compatible). `minimal`/`low`/`medium`/`high`/`xhigh`/`max`; which levels a model accepts is the provider's call (an unsupported one is its 400, recorded as data). Omit for the model's default. Can't be combined with an `extra_body` that sets the same field |
 | `api_key_env` | no* | env var holding the key |
 | `api_key` | no* | literal key (avoid; use `api_key_env`) |
 | `headers` | no | extra request headers |
@@ -119,6 +120,33 @@ installed and signed in, and to which plan.
 `[run] temperature` takes a number or `"omit"`. Unset, OpenAI-compatible targets
 get `0` and Claude API targets get nothing; `meta.json` records what each target
 was actually sent.
+
+## Grids: models × effort (`[[grids]]`)
+
+One block measures every combination. Each becomes an ordinary target — named
+`<name>/<model>@<effort>`, interleaved like any other, keyed in every statistic:
+
+```toml
+[[grids]]
+name = "claude-plan"
+api = "claude-code"
+models = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]
+effort = ["low", "high"]          # "default" = the model's own level
+```
+
+Every other key (`api`, `base_url`, `api_key_env`, `price`, `cli`, `extra_body`,
+`mock`, …) is shared by the grid's targets; `prices = { "<model>" = { in_per_1m, out_per_1m } }`
+overrides `price` per model. A config can mix `[[targets]]` and `[[grids]]`.
+
+From flags, a comma list does the same: `tps run --api claude-code --model
+claude-opus-5-5,claude-sonnet-5-5 --effort low,high` (and `init` writes the
+`[[grids]]` block).
+
+The terminal groups the results: one model across levels gets a "what effort
+costs" box (TTFT and hidden thinking per level); several models × levels get a
+`tok/s · ttft by effort` matrix. A one-line takeaway appears only when it holds
+for every model measured — tok/s flat across levels, and/or TTFT rising with
+each level.
 
 ## Pinning an upstream
 

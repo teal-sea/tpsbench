@@ -2354,7 +2354,9 @@ async def main() -> int:
             )
             proc = tps(["run", "-c", "effort-http.toml", "--dry-run", "--json"], work)
             check(
-                "cli config: effort on an HTTP target → exit 1", proc.returncode == 1, proc.stdout
+                "cli config: effort on an HTTP target is accepted (sent as reasoning_effort)",
+                proc.returncode == 0,
+                proc.stdout[-300:],
             )
 
             proc = tps(["doctor", "-c", "cc.toml", "--json"], work, env_extra=cli_env)
@@ -2425,6 +2427,176 @@ async def main() -> int:
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
+
+        print("effort and grids:")
+
+        def body_for(api: str, url: str, effort: str | None) -> dict:
+            t = core.Target(name="t", base_url=url, model="m", api=api, effort=effort)
+            return core.request_body(t, cfg, "hi", 32, stream=True)
+
+        check(
+            "effort: Claude API → output_config.effort",
+            body_for("anthropic", base, "high").get("output_config") == {"effort": "high"},
+        )
+        check(
+            "effort: OpenAI-compatible → reasoning_effort",
+            body_for("openai", base, "low").get("reasoning_effort") == "low",
+        )
+        check(
+            "effort: OpenRouter → reasoning.effort",
+            body_for("openai", "https://openrouter.ai/api/v1", "medium").get("reasoning")
+            == {"effort": "medium"},
+        )
+        plain = body_for("openai", base, None)
+        check(
+            "effort: unset sends nothing (the model's default)",
+            not ({"reasoning", "reasoning_effort", "output_config"} & set(plain)),
+            str(plain),
+        )
+        grid_toml = (
+            '[run]\nreps = 1\nwarmup = 0\nprompts = ["prose-256"]\n\n'
+            "[[grids]]\n"
+            'name = "g"\n'
+            f'base_url = "{base}"\n'
+            'api_key = "good-key"\n'
+            'models = ["test-model", "big-chunks"]\n'
+            'effort = ["default", "high"]\n'
+            "price = { in_per_1m = 1, out_per_1m = 2 }\n"
+            'prices = { "big-chunks" = { in_per_1m = 3, out_per_1m = 4 } }\n'
+        )
+        (work / "grid.toml").write_text(grid_toml, encoding="utf-8")
+        grid = core.load_config(work / "grid.toml")
+        check(
+            "grid: one target per model × effort",
+            [t.name for t in grid.targets]
+            == ["g/test-model", "g/test-model@high", "g/big-chunks", "g/big-chunks@high"],
+            str([t.name for t in grid.targets]),
+        )
+        check(
+            "grid: 'default' sends no effort, others do",
+            [t.effort for t in grid.targets] == [None, "high", None, "high"],
+        )
+        check(
+            "grid: per-model prices override the shared price",
+            [t.price_out for t in grid.targets] == [2, 2, 4, 4],
+            str([t.price_out for t in grid.targets]),
+        )
+        for label, broken in (
+            ("grid without a name", grid_toml.replace('name = "g"\n', "")),
+            ("grid with a repeated model", grid_toml.replace('"big-chunks"]', '"test-model"]')),
+            (
+                "grid price for a model it doesn't have",
+                grid_toml.replace('{ "big-chunks"', '{ "x"'),
+            ),
+            (
+                "effort and extra_body both setting it",
+                grid_toml + 'extra_body = { reasoning_effort = "low" }\n',
+            ),
+            ("unknown effort level", grid_toml.replace('"high"]', '"turbo"]')),
+        ):
+            (work / "grid-bad.toml").write_text(broken, encoding="utf-8")
+            proc = tps(["run", "-c", "grid-bad.toml", "--dry-run", "--json"], work)
+            check(f"config: {label} → exit 1", proc.returncode == 1, proc.stdout[-300:])
+        proc = tps(["run", "-c", "grid.toml", "-o", "grid-run", "--json"], work)
+        sent = {BODIES.get(m, {}).get("reasoning_effort") for m in ("test-model", "big-chunks")}
+        check(
+            "grid run: every target measured, effort reached the server",
+            proc.returncode == 0
+            and len(json.loads(proc.stdout or "{}").get("results", [])) == 4
+            and "high" in sent,
+            f"{proc.returncode} {sent} {proc.stdout[-200:]}",
+        )
+        proc = tps(
+            [
+                "run",
+                "--api",
+                "claude-code",
+                "--model",
+                "a,b",
+                "--effort",
+                "low,high",
+                "--dry-run",
+                "--json",
+            ],
+            work,
+        )
+        plan = json.loads(proc.stdout or "{}").get("plan", {})
+        check(
+            "flags: --model a,b --effort low,high → a 4-target grid",
+            [t["target"] for t in plan.get("targets", [])]
+            == [
+                "claude-code/a@low",
+                "claude-code/a@high",
+                "claude-code/b@low",
+                "claude-code/b@high",
+            ],
+            proc.stdout[-300:],
+        )
+        proc = tps(["run", "--api", "claude-code", "--model", "a", "--effort", "turbo"], work)
+        check("flags: unknown --effort → exit 1", proc.returncode == 1, proc.stdout[-200:])
+
+        one = (
+            '[run]\nreps = 2\nwarmup = 0\nprompts = ["prose-256"]\n\n[[grids]]\nname = "x"\n'
+            f'base_url = "{base}"\napi_key = "k"\nmodels = ["atlas"]\n'
+            'effort = ["low", "medium", "high"]\n'
+            "mock = { ttft = [0.40, 0.42], itl = [0.0100, 0.0101] }\n"
+        )
+        (work / "effort-one.toml").write_text(one, encoding="utf-8")
+        screen = tps(
+            ["run", "-c", "effort-one.toml", "--mock", "-o", "e1"],
+            work,
+            env_extra={"COLUMNS": "100"},
+        ).stdout
+        check(
+            "effort view: rows by effort + 'what effort costs' box",
+            "│ effort" in screen and "atlas · what effort costs" in screen,
+            screen,
+        )
+        check(
+            "effort view: thinking said once (box), not per row",
+            "TTFT includes ~" not in screen,
+            screen,
+        )
+        check("effort view: takeaway line", "→ effort barely moves tok/s" in screen, screen)
+        (work / "effort-grid.toml").write_text(
+            one.replace('models = ["atlas"]', 'models = ["atlas", "comet"]'), encoding="utf-8"
+        )
+        screen = tps(
+            ["run", "-c", "effort-grid.toml", "--mock", "-o", "e2"],
+            work,
+            env_extra={"COLUMNS": "100"},
+        ).stdout
+        check(
+            "effort view: several models × levels → one matrix",
+            "tok/s · ttft by effort" in screen and "│ model" in screen,
+            screen,
+        )
+
+        def row(model, effort, tps_, ttft):
+            return {
+                "model": model,
+                "effort": effort,
+                "out_tps_p50": tps_,
+                "ttft_p50_s": ttft,
+                "concurrency": 1,
+                "by_concurrency": {"1": {"reasoning_only": 0}},
+            }
+
+        from tps import cli as tps_cli
+
+        flat = [row("a", "low", 100, 1.0), row("a", "high", 98, 3.0)]
+        check(
+            "takeaway: says it when it holds",
+            tps_cli.effort_takeaway(flat)
+            == "effort barely moves tok/s (≤2%) · it costs ttft: +2.0s from low to high",
+            str(tps_cli.effort_takeaway(flat)),
+        )
+        mixed_up = [row("a", "low", 100, 3.0), row("a", "high", 70, 1.0)]
+        check(
+            "takeaway: silent when it doesn't hold for every row",
+            tps_cli.effort_takeaway(mixed_up) is None,
+            str(tps_cli.effort_takeaway(mixed_up)),
+        )
 
         print("report provenance:")
         (work / "unknown_rate.toml").write_text(

@@ -122,7 +122,7 @@ endpoint directly (with `--api-key-env`, `--name`, `--price` as in `init
 anthropic` speaks the native Claude Messages API instead (URL defaults to
 `https://api.anthropic.com/v1`, with an API key) — see
 [configuration](configuration.md#claude-api-anthropic). `--api claude-code --model
-ID [--effort LEVEL]` measures your **Claude subscription** through the signed-in
+ID[,ID…] [--effort LEVEL[,LEVEL…]]` measures your **Claude subscription** through the signed-in
 `claude` CLI — no URL, key or price — see
 [configuration](configuration.md#claude-subscription-api-claude-code).
 
