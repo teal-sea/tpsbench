@@ -19,13 +19,14 @@ import io
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from . import __version__, core
+from . import __version__, clis, core
 from .ui import UI, Bar, Col, Progress
 
 SCHEMA_VERSION = 1
@@ -119,18 +120,16 @@ def require_keys(cfg: core.RunConfig) -> None:
 
 
 def missing_clis(cfg: core.RunConfig) -> list[core.Target]:
-    return [t for t in cfg.targets if t.is_cli and t.mock is None and not t.cli_path()]
+    return [t for t in cfg.targets if t.is_cli and not t.cli_path()]
 
 
 def cli_checks(cfg: core.RunConfig) -> list[tuple[str, str, bool]]:
-    """One doctor row per distinct CLI: installed, version, signed in, plan.
-
-    Uses `claude auth status --json`; the account email is never shown.
-    """
+    """One doctor row per distinct client: installed, version, signed in, plan.
+    The backend reads the sign-in; the account email is never shown."""
     rows = []
     seen: set[str] = set()
     for target in cfg.targets:
-        if not target.is_cli or target.mock is not None or target.cli_binary() in seen:
+        if not target.is_cli or target.cli_binary() in seen:
             continue
         binary = target.cli_binary()
         seen.add(binary)
@@ -145,53 +144,56 @@ def cli_checks(cfg: core.RunConfig) -> list[tuple[str, str, bool]]:
         except (OSError, subprocess.TimeoutExpired) as exc:
             rows.append((binary, f"{path} · can't query it: {type(exc).__name__}", False))
             continue
-        status = cli_auth_status(path)
-        if not status.get("loggedIn"):
-            rows.append(
-                (binary, f"{version or path} · not signed in — run `{binary} auth login`", False)
-            )
-            continue
-        method = status.get("authMethod") or "?"
-        plan = status.get("subscriptionType")
-        detail = f"{version or path} · signed in ({method}{', ' + plan if plan else ''})"
-        if method != "claude.ai":
-            detail += " — not a subscription sign-in; usage is billed to that account"
-        rows.append((binary, detail, True))
+        auth = target.backend.auth(path)
+        where = version or path
+        if auth.signed_in is None:
+            rows.append((binary, f"{where} · sign-in unknown — {auth.why}", False))
+        elif not auth.signed_in:
+            rows.append((binary, f"{where} · not signed in — sign in with `{binary}` first", False))
+        else:
+            how = ", ".join(x for x in (auth.method, (auth.plan or "").lower() or None) if x)
+            detail = f"{where} · signed in" + (f" ({how})" if how else "")
+            if not auth.subscription:
+                detail += " — not a subscription sign-in; usage is billed to that account"
+            rows.append((binary, detail, True))
     return rows
 
 
-def cli_auth_status(path: str) -> dict[str, Any]:
-    """`claude auth status --json`, or {} when it can't be read."""
-    try:
-        raw = subprocess.run(
-            [path, "auth", "status", "--json"], capture_output=True, text=True, timeout=20
-        ).stdout
-        return json.loads(raw) if raw.strip().startswith("{") else {}
-    except (OSError, subprocess.TimeoutExpired, ValueError):
-        return {}
+def prepare_clis(cfg: core.RunConfig) -> None:
+    """Before a real run: check each CLI's sign-in, name its plan, and let the
+    backend resolve what requests would otherwise look up while being timed.
 
-
-def label_plans(cfg: core.RunConfig) -> None:
-    """Name the plan each CLI target is signed in to ("Max"), for headers and
-    reports. Best effort: an unreadable status just leaves it unnamed."""
-    cache: dict[str, str | None] = {}
+    Signed out → MissingKeyError (exit 2: ask the human), before any plan usage
+    is spent. Unknown sign-in doesn't block; the plan just stays unnamed.
+    """
+    by_path: dict[str, list[core.Target]] = {}
     for target in cfg.targets:
-        path = target.cli_path() if target.is_cli and target.mock is None else None
-        if not path:
+        path = target.cli_path() if target.is_cli else None
+        if path:
+            by_path.setdefault(path, []).append(target)
+    signed_out = []
+    for path, targets in by_path.items():
+        backend = targets[0].backend
+        auth = backend.auth(path)
+        if auth.signed_in is False:
+            signed_out.append(f"`{targets[0].cli_binary()}` ({', '.join(t.name for t in targets)})")
             continue
-        if path not in cache:
-            status = cli_auth_status(path)
-            plan = (
-                status.get("subscriptionType") if status.get("authMethod") == "claude.ai" else None
-            )
-            cache[path] = str(plan).capitalize() if plan else None
-        target.plan = cache[path]
+        plan = auth.plan if auth.signed_in and auth.subscription else None
+        for target in targets:
+            target.plan = plan
+        backend.prepare(path, targets)
+    if signed_out:
+        raise core.MissingKeyError(
+            f"not signed in: {'; '.join(signed_out)} — sign in with that CLI first "
+            "(`tps doctor` shows which)"
+        )
 
 
 def plan_title(rows: list[dict[str, Any]]) -> str:
-    """ "Claude Max plan" — or just "plan" when the CLI didn't say which."""
+    """ "Claude Max plan" — or just "plan" when the client didn't say which."""
     plans = sorted({r.get("plan") for r in rows} - {None})
-    vendor = "Claude " if all(r.get("api") == "claude-code" for r in rows) else ""
+    apis = {r.get("api") for r in rows}
+    vendor = clis.backend(next(iter(apis))).vendor + " " if len(apis) == 1 else ""
     return f"{vendor}{plans[0]} plan" if len(plans) == 1 else f"{vendor}plan".strip()
 
 
@@ -223,7 +225,8 @@ def endpoint_config(
     extras = {"--api-key-env": args.api_key_env, "--name": args.name, "--price": args.price}
     if flag == "--base-url":
         extras["--model"] = args.model
-    effort = getattr(args, "effort", None)
+    effort = _effort_list(getattr(args, "effort", None), args.api)
+    models = [m.strip() for m in (args.model or "").split(",") if m.strip()]
     if args.api in core.CLI_APIS:
         # a CLI target has no URL, key or price: the vendor's client signs in
         stray = [n for n, v in extras.items() if v is not None and n not in ("--name", "--model")]
@@ -232,17 +235,19 @@ def endpoint_config(
         if stray:
             raise core.UsageError(f"{', '.join(stray)} can't apply to --api {args.api}")
         if not args.model:
-            raise core.UsageError(f"--api {args.api} needs --model, e.g. claude-opus-5-5")
+            raise core.UsageError(
+                f"--api {args.api} needs --model, e.g. {clis.backend(args.api).example_model}"
+            )
         return core.cli_target_toml(
             args.api,
-            args.model,
+            models,
             args.name,
             effort,
             source=f"tps {args.command} --api {args.api}",
             run_block=run_block,
         )
-    if effort is not None:
-        raise core.UsageError(f"--effort only applies to --api {'/'.join(core.CLI_APIS)} so far")
+    if effort and url is None and args.api is None:
+        raise core.UsageError(f"--effort needs {flag} or --api (or set `effort` in a config)")
     if url is None and args.api == "anthropic":
         url = CLAUDE_API_URL  # `--api anthropic` alone means Anthropic's own endpoint
     elif url is None and args.api is not None:
@@ -257,14 +262,29 @@ def endpoint_config(
         raise core.UsageError(f"{flag} needs --model — the model id that endpoint serves")
     return core.endpoint_toml(
         url,
-        args.model,
+        models,
         args.name,
         args.api_key_env,
         _price_pair(args.price),
         source=f"tps {args.command} {flag}",
         api=args.api or "openai",
         run_block=run_block,
+        effort=effort,
     )
+
+
+def _effort_list(text: str | None, api: str | None) -> list[str] | None:
+    """`--effort low,high` → ["low", "high"]; "default" means the model's own."""
+    if text is None:
+        return None
+    levels = [e.strip().lower() for e in text.split(",") if e.strip()]
+    allowed = clis.backend(api).efforts if api in core.CLI_APIS else core.EFFORTS_HTTP
+    bad = [e for e in levels if e not in (*allowed, "default")]
+    if not levels or bad:
+        raise core.UsageError(
+            f"--effort takes a comma list of {', '.join(allowed)} or default — got {text!r}"
+        )
+    return levels
 
 
 def check_mock(cfg: core.RunConfig, path: Path, mock: bool, ui: UI) -> None:
@@ -360,6 +380,7 @@ def summarise(samples: list[dict[str, Any]], meta: dict[str, Any]) -> dict[str, 
                 "ttft_p50_s": _r(st["ttft_p50_s"]),
                 "ttft_p90_s": _r(st["ttft_p90_s"]),
                 "startup_p50_s": _r(st["startup_p50_s"]),
+                "api_calls_median": st["api_calls_median"],
                 "first_content_p50_s": _r(st["first_content_p50_s"]),
                 "out_tps_p50": _r(st["out_tps_p50"], 2),
                 "out_tps_p90": _r(st["out_tps_p90"], 2),
@@ -392,6 +413,12 @@ def summarise(samples: list[dict[str, Any]], meta: dict[str, Any]) -> dict[str, 
                 "price_out_per_1m": info.get("price_out"),
             }
         )
+    served: dict[str, set[str]] = {}
+    for sample in samples:
+        if sample.get("served_model") and sample.get("ok"):
+            served.setdefault(sample["target"], set()).add(sample["served_model"])
+    for row in rows:
+        row["served_models"] = sorted(served.get(row["target"], ()))
     return {"rows": rows, "baseline": meta.get("baseline")}
 
 
@@ -432,7 +459,7 @@ def print_run_table(ui: UI, summary: dict[str, Any], prompt: str) -> None:
     # a shared first-column width lines the columns up from box to box
     label_w = max(len(x) for g in groups for x in [_row_labels(g)[0], *_row_labels(g)[1]])
     bar_w, width = 24, 0
-    if len(groups) > 1:
+    if len(groups) > 1 and not any(_is_matrix(g) for g in groups):
         # boxes shown together share one width and one bar width, so their
         # columns line up: size the bars so the widest box needs no shrinking
         args = (summary["baseline"], prompt, conc, peak, True, label_w, bar_w)
@@ -443,7 +470,184 @@ def print_run_table(ui: UI, summary: dict[str, Any], prompt: str) -> None:
         width = natural - (24 - bar_w)
     args = (summary["baseline"], prompt, conc, peak, len(groups) > 1, label_w, bar_w)
     for group in groups:
-        _run_box(ui, group, *args, min_inner=width)
+        if _is_matrix(group):
+            inner = _effort_matrix(ui, group, prompt)
+        else:
+            inner = _run_box(ui, group, *args, min_inner=width)
+        if len({_series(r) for r in group}) == 1 and len(_efforts(group)) > 1:
+            _effort_cost(ui, group, min_inner=inner)
+        if line := effort_takeaway(group):
+            ui.say()
+            ui.say(f"  {ui.cyan('→')} {line}")
+
+
+def _effort_rank(effort: str | None) -> int:
+    """`default` (None) first, then minimal → ultra; an unknown level sorts last."""
+    if effort is None:
+        return -1
+    order = core.EFFORT_ORDER
+    return order.index(effort) if effort in order else len(order)
+
+
+def _efforts(rows: list[dict[str, Any]]) -> list[str | None]:
+    return sorted({r.get("effort") for r in rows}, key=_effort_rank)
+
+
+def _provider(row: dict[str, Any]) -> str:
+    """The target name without a grid's `/<model>@<effort>` suffix, so rows from
+    one grid share a provider while `baseten/fast` and `baseten/turbo` don't."""
+    name, model, effort = str(row.get("target") or ""), str(row.get("model")), row.get("effort")
+    for suffix in (f"/{model}@{effort}", f"/{model}"):
+        if name.endswith(suffix) and len(name) > len(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def _series(row: dict[str, Any]) -> tuple[str, str]:
+    """What an effort comparison holds fixed: where requests go (the client for
+    CLI rows; base URL and routing pin for HTTP rows) and the model. Names are
+    labels, not identity: `opus-low` and `opus-high` on one endpoint are one series.
+    """
+    if row.get("access") == "cli":
+        where = f"cli:{row.get('api')}"
+    else:
+        where = f"{row.get('base_url')}|{json.dumps(row.get('pin'), sort_keys=True)}"
+    return where, str(row.get("model"))
+
+
+def _series_names(rows: list[dict[str, Any]]) -> dict[tuple[str, str], str]:
+    """Model names, prefixed by provider only when several providers are present."""
+    label = {}
+    for r in rows:
+        label.setdefault(_series(r), (_provider(r), str(r.get("model"))))
+    several = len({where for where, _m in label}) > 1
+    return {k: f"{p} · {m}" if several else m for k, (p, m) in label.items()}
+
+
+def _is_matrix(rows: list[dict[str, Any]]) -> bool:
+    """Several models (or providers) × several effort levels: a matrix — unless
+    two rows would share a cell (the same thing measured twice): then rows."""
+    cells = {(_series(r), r.get("effort")) for r in rows}
+    return (
+        len({_series(r) for r in rows}) > 1 and len(_efforts(rows)) > 1 and len(cells) == len(rows)
+    )
+
+
+def _effort_matrix(ui: UI, rows: list[dict[str, Any]], prompt: str) -> int:
+    efforts = _efforts(rows)
+    names = _series_names(rows)
+    cell = {(_series(r), r.get("effort")): r for r in rows}
+    rated = [r["out_tps_p50"] for r in rows if r["out_tps_p50"] and not _thinking(r)]
+    best = max(rated) if len(rated) > 1 else None
+    table = []
+    for key, label in names.items():
+        line: list[Any] = [label]
+        for effort in efforts:
+            r = cell.get((key, effort))
+            if r is None:
+                line.append(("—", ui.grey))
+            elif not r["ok"]:
+                line.append(("failed", ui.red))
+            elif r["out_tps_p50"] is None or r["ttft_p50_s"] is None:
+                line.append(("no answer", ui.yellow))
+            else:
+                text = f"{r['out_tps_p50']:.1f} · {r['ttft_p50_s']:.1f}s"
+                if r["ok"] < r["n"]:
+                    line.append((text + " !", ui.yellow))
+                else:
+                    line.append((text, ui.best if r["out_tps_p50"] == best else None))
+        table.append(line)
+    cli = rows[0].get("access") == "cli"
+    title = f"{prompt} · tok/s · ttft by effort" + (f" · {plan_title(rows)}" if cli else "")
+    footer = "p50 · green = fastest tok/s"
+    footer += _alias_note(rows)
+    if any(0 < r["ok"] < r["n"] for r in rows):
+        footer += " · ! = some requests failed"
+    if cli:
+        startup = core.median([r.get("startup_p50_s") for r in rows])
+        footer += " · ttft incl. " + (f"~{startup:.1f}s " if startup else "") + "CLI startup"
+    ui.say()
+    return ui.table(
+        [Col("provider · model" if " · " in next(iter(names.values())) else "model", "l")]
+        + [Col(e or "default") for e in efforts],
+        table,
+        title=title,
+        footer=footer,
+    )
+
+
+def _alias_note(rows: list[dict[str, Any]]) -> str:
+    """ " · opus = claude-opus-5-5" for models asked for by alias."""
+    resolved = {}
+    for r in rows:
+        ids = r.get("served_models") or []
+        if len(ids) == 1 and ids[0] != r.get("model"):
+            resolved[r.get("model")] = ids[0]
+    return "".join(f" · {alias} = {full}" for alias, full in resolved.items())
+
+
+def _effort_cost(ui: UI, rows: list[dict[str, Any]], min_inner: int = 0) -> None:
+    """One model across effort levels: how TTFT and thinking grow."""
+    ordered = sorted(rows, key=lambda r: _effort_rank(r.get("effort")))
+    timed = [r for r in ordered if r["ttft_p50_s"] is not None]
+    if len(timed) < 2:
+        return
+    peak = max(r["ttft_p50_s"] for r in timed)
+    table = []
+    for r in timed:
+        thinking = r.get("hidden_reasoning_tokens_median")
+        table.append(
+            [
+                r.get("effort") or "default",
+                _secs(r["ttft_p50_s"]),
+                Bar(r["ttft_p50_s"], peak, 30, ui.magenta),
+                f"~{thinking:.0f} tok" if thinking else "—",
+            ]
+        )
+    ui.say()
+    ui.table(
+        [Col("effort", "l"), Col("ttft"), Col("", "l", flex=True), Col("thinking")],
+        table,
+        title=f"{rows[0].get('model')} · what effort costs",
+        footer="thinking tokens are generated, unseen, before the first visible token",
+        min_inner=min_inner,
+    )
+
+
+def effort_takeaway(rows: list[dict[str, Any]]) -> str | None:
+    """One sentence about effort, only when it holds for every model measured:
+    tok/s stays flat, and/or TTFT rises with each level."""
+    names = _series_names(rows)
+    by_model: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for r in rows:
+        if r["out_tps_p50"] is not None and r["ttft_p50_s"] is not None and not _thinking(r):
+            by_model.setdefault(_series(r), []).append(r)
+    series = [
+        sorted(rs, key=lambda r: _effort_rank(r.get("effort")))
+        for rs in by_model.values()
+        if len({r.get("effort") for r in rs}) > 1
+    ]
+    if not series:
+        return None
+    clauses = []
+    spreads = [
+        (max(r["out_tps_p50"] for r in s) - min(r["out_tps_p50"] for r in s))
+        / max(r["out_tps_p50"] for r in s)
+        for s in series
+    ]
+    if max(spreads) < 0.05:
+        clauses.append(f"effort barely moves tok/s (≤{max(spreads):.0%})")
+    rising = all(
+        all(b["ttft_p50_s"] >= a["ttft_p50_s"] for a, b in zip(s, s[1:], strict=False))
+        for s in series
+    )
+    if rising:
+        worst = max(series, key=lambda s: s[-1]["ttft_p50_s"] - s[0]["ttft_p50_s"])
+        delta = worst[-1]["ttft_p50_s"] - worst[0]["ttft_p50_s"]
+        low, high = (worst[0].get("effort") or "default"), (worst[-1].get("effort") or "default")
+        where = f" on {names[_series(worst[0])]}" if len(series) > 1 else ""
+        clauses.append(f"it costs ttft: +{delta:.1f}s from {low} to {high}{where}")
+    return " · ".join(clauses) or None
 
 
 def _by_access(rows: list[dict[str, Any]], access: str) -> list[dict[str, Any]]:
@@ -454,7 +658,16 @@ def _row_labels(rows: list[dict[str, Any]]) -> tuple[str, list[str]]:
     """The first column: provider names for HTTP rows; for CLI rows, whichever of
     model and effort varies (shared values are in the box title instead)."""
     if rows[0].get("access", "http") != "cli":
-        return "provider", [r["target"] for r in rows]
+        if len({r.get("model") for r in rows}) == 1 and len({r.get("effort") for r in rows}) == 1:
+            return "provider", [r["target"] for r in rows]
+        # a grid: name rows by what varies, as for CLI rows
+        parts = {
+            "provider": _provider,
+            "model": lambda r: r.get("model"),
+            "effort": lambda r: r.get("effort") or "default",
+        }
+        vary = [k for k, get in parts.items() if len({get(r) for r in rows}) > 1]
+        return " · ".join(vary), [" · ".join(str(parts[k](r)) for k in vary) for r in rows]
     vary = [k for k in ("model", "effort") if len({r.get(k) for r in rows}) > 1]
     if not vary:
         if len({r.get("api") for r in rows}) == len(rows):
@@ -553,16 +766,23 @@ def _run_box(
     legend = "p50 · ttft first token · tok/s decode rate · itl gap between chunks"
     if cli:
         title += " · " + plan_title(rows)
-        shared = [rows[0]["model"]] if _shared(rows, "model") else []
+        shared = [_resolved(rows[0])] if _shared(rows, "model") else []
         if _shared(rows, "effort"):
             shared.append(f"effort {rows[0]['effort']}")
         if shared and _row_labels(rows)[0] != "target":
             title += " · " + " · ".join(shared)
         startup = core.median([r.get("startup_p50_s") for r in rows])
         legend = "p50 · ttft incl. " + (f"~{startup:.1f}s " if startup else "")
-        legend += "CLI startup — compare within this box · tok/s decode rate"
-    elif mixed:
-        title += " · API"
+        legend += "CLI startup — compare within this box"
+        if not all(clis.backend(r["api"]).caps_output for r in rows):
+            legend += " · no output cap"
+    else:
+        title += " · API" if mixed else ""
+        if _row_labels(rows)[0] not in ("provider", "target"):
+            if _shared(rows, "model"):
+                title += f" · {rows[0]['model']}"
+            if _shared(rows, "effort"):
+                title += f" · effort {rows[0]['effort']}"
     if estimated:
         legend += " · ≈ chars/4 estimate"
     if any(r["bursty"] for r in rows):
@@ -575,11 +795,20 @@ def _run_box(
         for note in r["notes"]:
             if cli and note.startswith("CLI target:"):
                 continue  # the box's footer says it once
+            if note.startswith("TTFT includes ~") and len(_efforts(rows)) > 1:
+                continue  # the "what effort costs" box shows thinking per level
             first, *rest = _wrap(f"{r['target']}: {note}", ui.width - 6)
             ui.warn(first)
             for line in rest:
                 ui.say("    " + line)
     return inner
+
+
+def _resolved(row: dict[str, Any]) -> str:
+    """The model as asked for, plus what it resolved to when that differs."""
+    ids = row.get("served_models") or []
+    asked = str(row.get("model"))
+    return f"{asked} ({ids[0]})" if len(ids) == 1 and ids[0] != asked else asked
 
 
 def _shared(rows: list[dict[str, Any]], key: str) -> bool:
@@ -634,13 +863,20 @@ def print_load_table(ui: UI, summary: dict[str, Any], prompt: str) -> None:
 
 
 def _display_names(rows: list[dict[str, Any]]) -> dict[str, str]:
-    """What callouts call each row: the box's own label, "plan · low" for CLI rows."""
+    """What callouts call each row: the box's own label ("plan · low" for CLI
+    rows), so a name in a callout matches a row in a box."""
     names = {r["target"]: r["target"] for r in rows}
-    cli = [r for r in rows if r.get("access") == "cli"]
-    if cli:
-        header, labels = _row_labels(cli)
-        if header != "target":
-            names.update({r["target"]: f"plan · {lab}" for r, lab in zip(cli, labels, strict=True)})
+    for access in ("http", "cli"):
+        group = _by_access(rows, access)
+        if not group:
+            continue
+        header, labels = _row_labels(group)
+        if header in ("target", "provider"):
+            continue
+        prefix = "plan · " if access == "cli" else ""
+        if header == "effort":
+            labels = [f"effort {lab}" for lab in labels]
+        names.update({r["target"]: prefix + lab for r, lab in zip(group, labels, strict=True)})
     return names
 
 
@@ -672,7 +908,7 @@ def print_rankings(ui: UI, summary: dict[str, Any], prompt: str) -> None:
             )
         lines.append(("●", "snappiest", name[snappiest["target"]], detail))
     priced = [r for r in rows if r["price_out_per_1m"] is not None]
-    if priced:
+    if len({r["price_out_per_1m"] for r in priced}) > 1:
         cheapest = min(priced, key=lambda r: r["price_out_per_1m"])
         lines.append(
             (
@@ -708,17 +944,22 @@ def attach_cost(summary: dict[str, Any], cost: dict[str, Any]) -> None:
 
 
 def _plan_spend(cost: dict[str, Any]) -> str | None:
-    """ "Claude Max plan: 12 requests, 5-hour window 6% → 9%" for CLI targets."""
-    plan = cost.get("plan")
-    if not plan:
-        return None
-    name = f"{plan['plans'][0]} plan" if len(plan["plans"]) == 1 else "plan"
-    text = f"{_n(plan['requests'], 'request')} on your {name}"
-    first, last = plan["utilization_first"], plan["utilization_last"]
-    if first is not None and last is not None:
-        window = {"five_hour": "5-hour", "seven_day": "7-day"}.get(plan["window"], "usage")
-        text += f", {window} window {first:.0%} → {last:.0%}"
-    return text
+    """ "12 requests on your Claude Max plan, 5-hour window 6% → 9%" per plan."""
+    parts = []
+    for plan in cost.get("plan") or []:
+        vendor = clis.backend(plan["api"]).vendor if plan["api"] in clis.BACKENDS else ""
+        name = " ".join(
+            x for x in (vendor, plan["plans"][0] if len(plan["plans"]) == 1 else "") if x
+        )
+        text = f"{_n(plan['requests'], 'request')} on your {name + ' ' if name else ''}plan"
+        first, last = plan["utilization_first"], plan["utilization_last"]
+        if first is not None and last is not None:
+            window = {"five_hour": "5-hour", "seven_day": "7-day"}.get(plan["window"], "usage")
+            text += f", {window} window {first:.0%} → {last:.0%}"
+            if plan.get("reset"):
+                text += " (reset during the run)"
+        parts.append(text)
+    return " · ".join(parts) or None
 
 
 def print_spend(ui: UI, cost: dict[str, Any]) -> None:
@@ -981,11 +1222,17 @@ def cmd_init(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
     ui.header("init")
     ui.say()
     if text is not None:
-        made = core.config_from_text(text, "--endpoint").targets[0]
+        expanded = core.config_from_text(text, "--endpoint").targets
+        made = expanded[0]
         url = None if made.is_cli else core.redact_url(made.base_url)
         out.write_text(text, encoding="utf-8")
         where = f"via `{made.cli_binary()}` (your plan)" if made.is_cli else f"at {url}"
-        ui.ok(f"wrote {ui.bold(str(out))} — 1 target: {args.model} {where}")
+        what = (
+            f"1 target: {made.model}"
+            if len(expanded) == 1
+            else f"{_n(len(expanded), 'target')} (models × effort levels)"
+        )
+        ui.ok(f"wrote {ui.bold(str(out))} — {what} {where}")
         export = f"export {args.api_key_env}=… && " if args.api_key_env else ""
         ui.hint(f"  next → {export}tps run -c {out} --dry-run   (then without --dry-run)")
         return {
@@ -993,7 +1240,7 @@ def cmd_init(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
             "ok": True,
             "config": str(out),
             "model": args.model,
-            "targets": 1,
+            "targets": len(expanded),
             "endpoint": url,
         }
     if args.model:
@@ -1115,7 +1362,7 @@ def run_plan(
     no_cli = [] if args.mock else [t.name for t in missing_clis(cfg)]
     plan_billed = [t.name for t in cfg.targets if t.is_cli]
     ui.header(
-        "run",
+        getattr(args, "label", "run"),
         f"{_models_label(cfg)} · dry run",
         mock=args.mock,
         plan=any(t.is_cli for t in cfg.targets),
@@ -1226,8 +1473,13 @@ def cmd_run(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
         path.write_text(text, encoding="utf-8")
     total = core.planned_requests(cfg)
     if not args.mock:
-        label_plans(cfg)
-    ui.header("run", _models_label(cfg), mock=args.mock, plan=any(t.is_cli for t in cfg.targets))
+        prepare_clis(cfg)
+    ui.header(
+        getattr(args, "label", "run"),
+        _models_label(cfg),
+        mock=args.mock,
+        plan=any(t.is_cli for t in cfg.targets),
+    )
     ui.hint(
         f"  {_n(len(cfg.targets), 'target')} · {_n(len(cfg.prompts), 'prompt')} · {_n(cfg.reps, 'rep')} · "
         f"concurrency {','.join(map(str, cfg.concurrency))} · {total} requests"
@@ -1307,6 +1559,63 @@ def cmd_run(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
             "raw": str(outdir / "raw.jsonl"),
         },
     }
+
+
+def cmd_plan(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
+    """`tps claude [models…]` (one command per CLI backend): benchmark the
+    models in your plan. A shortcut for `tps run --api <backend> …` with
+    plan-friendly defaults; it runs the very same code, so output, JSON and
+    exit codes match `run`.
+    """
+    backend = clis.backend(args.backend_api)
+    named = args.models
+    if not named and (args.mock or args.dry_run) and not backend.default_models:
+        # nothing is sent in a dry run or under --mock: don't ask the plan
+        named = [backend.example_model]
+        ui.warn(
+            f"no model named — showing {backend.example_model}; a real run uses "
+            "your plan's default model"
+        )
+    if not named:
+        named, why = backend.defaults(shutil.which(backend.binary))
+        if not named:
+            raise core.UsageError(
+                f"couldn't read your plan's default model ({why}) — name one, "
+                f"e.g. tps {backend.command} {backend.example_model}"
+            )
+    models = [m for arg in named for m in arg.split(",") if m]
+    efforts = None
+    if args.effort:
+        efforts = ",".join(backend.efforts) if args.effort.strip() == "all" else args.effort
+    run_argv = ["run", "--api", backend.api, "--model", ",".join(models)]
+    run_argv += ["--max-tokens", str(args.max_tokens), "--reps", str(args.reps)]
+    run_argv += ["--prompts", args.prompt]
+    if efforts:
+        run_argv += ["--effort", efforts]
+    if args.out:
+        run_argv += ["-o", str(args.out)]
+    if args.mock:
+        run_argv.append("--mock")
+    run_args = build_parser().parse_args(run_argv)
+    for flag in ("json", "no_color", "quiet", "verbose"):
+        setattr(run_args, flag, getattr(args, flag, False))
+    run_args.label = backend.command
+
+    interactive = sys.stdin.isatty() and sys.stdout.isatty() and not ui.silent
+    if args.dry_run or (interactive and not args.yes and not args.mock):
+        run_args.dry_run = True
+        plan = cmd_run(run_args, ui)
+        if args.dry_run:
+            return plan
+        try:
+            answer = input("  run it on your plan? [Y/n] ").strip().lower()
+        except EOFError:
+            answer = "n"
+        if answer not in ("", "y", "yes"):
+            ui.hint("  cancelled — nothing was sent")
+            return {"command": "run", "ok": True, "cancelled": True}
+        run_args.dry_run = False
+    return cmd_run(run_args, ui)
 
 
 def cmd_report(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
@@ -1426,6 +1735,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Measure one model across many providers and gateways.",
         epilog=(
             "examples:\n"
+            "  tps claude                                 # the models in your Claude plan\n"
             "  tps run -c targets.mock.toml --mock        # 2-second offline demo\n"
             "  tps init --model deepseek/deepseek-v4.1-flash\n"
             "  tps doctor\n"
@@ -1444,10 +1754,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     def common(p: argparse.ArgumentParser) -> None:
         # mirrored on subcommands so `tps run --json` works as well as `tps --json run`
-        p.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
-        p.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS)
-        p.add_argument("-q", "--quiet", action="store_true", default=argparse.SUPPRESS)
-        p.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS)
+        p.add_argument(
+            "--json",
+            action="store_true",
+            default=argparse.SUPPRESS,
+            help="one JSON object on stdout",
+        )
+        p.add_argument(
+            "--no-color", action="store_true", default=argparse.SUPPRESS, help="no ANSI colour"
+        )
+        p.add_argument(
+            "-q", "--quiet", action="store_true", default=argparse.SUPPRESS, help="only errors"
+        )
+        p.add_argument(
+            "-v", "--verbose", action="store_true", default=argparse.SUPPRESS, help="tracebacks"
+        )
 
     def endpoint_flags(p: argparse.ArgumentParser, flag: str) -> None:
         p.add_argument(
@@ -1461,7 +1782,7 @@ def build_parser() -> argparse.ArgumentParser:
             "--model",
             default=None,
             help=(
-                "model id at that endpoint"
+                "model id at that endpoint (a comma list compares several)"
                 if flag == "--base-url"
                 else f"with {flag}: the model id there; alone: OpenRouter slug to discover"
             ),
@@ -1471,14 +1792,19 @@ def build_parser() -> argparse.ArgumentParser:
             choices=core.APIS,
             default=None,
             help=f"wire format (default openai); anthropic = native Claude API, {CLAUDE_API_URL} "
-            "unless a URL is given; claude-code = your Claude plan, via the signed-in "
-            "`claude` CLI (no URL or key)",
+            "unless a URL is given; "
+            + "; ".join(
+                f"{b.api} = your {b.vendor} plan via the signed-in `{b.binary}` CLI"
+                for b in clis.BACKENDS.values()
+            )
+            + " (no URL or key)",
         )
         p.add_argument(
             "--effort",
-            choices=core.EFFORTS,
             default=None,
-            help="reasoning effort (CLI targets); default: the model's own",
+            metavar="LEVELS",
+            help="reasoning effort, e.g. high or low,high (a grid: one target per "
+            "model × level); default = the model's own",
         )
         p.add_argument("--api-key-env", default=None, help="env var holding the key")
         p.add_argument("--name", default=None, help="target name (default: the host)")
@@ -1526,6 +1852,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--no-warmup", action="store_true", help="skip discarded warm-up requests")
     common(p_run)
 
+    for backend in clis.BACKENDS.values():
+        plan_shortcut(sub, backend, common)
+
     p_rep = sub.add_parser("report", help="re-render a previous run")
     p_rep.add_argument("run_dir", type=Path, help="folder printed by `tps run`")
     p_rep.add_argument("--markdown", action="store_true", help="print report.md instead of tables")
@@ -1544,11 +1873,64 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def plan_shortcut(sub, backend: clis.CliBackend, common) -> None:
+    """`tps <vendor>`: the models in that plan, from the backend's own words."""
+    width = max(len(a) for a, _ in backend.examples) + len(backend.command) + 7
+    examples = "".join(
+        f"  {f'tps {backend.command} {a}'.rstrip():<{width}}{what}\n"
+        for a, what in backend.examples
+    )
+    p = sub.add_parser(
+        backend.command,
+        help=f"benchmark the models in your {backend.vendor} plan",
+        description=(
+            f"Benchmark the models in your {backend.vendor} subscription through the signed-in\n"
+            f"`{backend.binary}` CLI. Runs on plan usage; nothing is billed per token."
+        ),
+        epilog=(
+            f"models: {backend.model_help}\n"
+            f"effort: {', '.join(backend.efforts)}, default, or all\n\n"
+            f"examples:\n{examples}\n"
+            f"the long form, for configs and scripts: tps run --api {backend.api} --model …"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.set_defaults(backend_api=backend.api)
+    p.add_argument(
+        "models", nargs="*", metavar="MODEL", help=f"default: {' '.join(backend.default_models)}"
+    )
+    p.add_argument("-e", "--effort", default=None, metavar="LEVELS", help="e.g. low,high or all")
+    p.add_argument(
+        "-n", "--reps", type=int, default=5, metavar="N", help="runs per model × level (5)"
+    )
+    p.add_argument(
+        "--prompt",
+        default="prose-256",
+        metavar="NAME",
+        help="prose-256 (default), code-256 or long-context",
+    )
+    p.add_argument(
+        "--max-tokens",
+        type=int,
+        default=2048,
+        metavar="N",
+        help="answer cap (2048: room to think, then answer)",
+    )
+    p.add_argument(
+        "-o", "--out", type=Path, default=None, metavar="DIR", help="run directory to create"
+    )
+    p.add_argument("--dry-run", action="store_true", help="show the plan; send nothing")
+    p.add_argument("-y", "--yes", action="store_true", help="don't ask before running")
+    p.add_argument("--mock", action="store_true", help="synthetic numbers, no network")
+    common(p)
+
+
 COMMANDS = {
     "doctor": cmd_doctor,
     "init": cmd_init,
     "discover": cmd_discover,
     "run": cmd_run,
+    **{command: cmd_plan for command in clis.by_command()},
     "report": cmd_report,
     "fingerprint": cmd_fingerprint,
 }

@@ -122,7 +122,7 @@ endpoint directly (with `--api-key-env`, `--name`, `--price` as in `init
 anthropic` speaks the native Claude Messages API instead (URL defaults to
 `https://api.anthropic.com/v1`, with an API key) — see
 [configuration](configuration.md#claude-api-anthropic). `--api claude-code --model
-ID [--effort LEVEL]` measures your **Claude subscription** through the signed-in
+ID[,ID…] [--effort LEVEL[,LEVEL…]]` measures your **Claude subscription** through the signed-in
 `claude` CLI — no URL, key or price — see
 [configuration](configuration.md#claude-subscription-api-claude-code).
 
@@ -143,6 +143,39 @@ in `missing_credentials`.
 `raw.jsonl` is written as batches finish and `meta.json` up front (with
 `"complete": false` until the end). **Ctrl-C keeps everything measured so far**,
 writes a report flagged `PARTIAL`, and exits 130.
+
+## `tps claude`
+
+The models in your Claude subscription, without a config file:
+
+```bash
+tps claude                          # opus, sonnet, haiku at their default effort
+tps claude opus sonnet -e low,high  # models × effort levels
+tps claude opus -e all              # every level
+tps claude haiku -n 10 --dry-run    # plan only
+```
+
+A shortcut for `tps run --api claude-code --model … --effort …` with plan
+defaults: 5 reps (`-n`), `--max-tokens 2048` (room to think, then answer), the
+`prose-256` prompt (`--prompt`). On a terminal it prints the dry-run plan and
+asks first; `-y` skips that, and off a terminal (`--json`, pipes, agents) it
+never asks. Output, JSON and exit codes are `run`'s. `opus`/`sonnet`/`haiku` are
+Claude Code's aliases for the latest of each; `served_models` and the box title
+name the exact model that answered. `tps claude --help` lists everything.
+
+## `tps codex`
+
+The models in your ChatGPT plan, the same way as `tps claude`:
+
+```bash
+tps codex                                  # the plan's default model, its default effort
+tps codex gpt-6.1-sol gpt-6-astra -e low,high
+tps codex gpt-6.1-sol -e all
+```
+
+Model names are the ids `codex` lists for your plan. Codex has no output cap
+(`--max-tokens` doesn't apply), and its text arrives in bursts — see
+[configuration](configuration.md#chatgpt-plan-api-codex).
 
 ## `tps report`
 

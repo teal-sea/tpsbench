@@ -24,7 +24,8 @@ A config is TOML with one `[run]` table and any number of `[[targets]]` tables.
 | `name` | yes | shows up in reports; must be unique (every statistic is keyed by it) — keep it stable across runs |
 | `base_url` | yes | API root; `/chat/completions` is appended (`/messages` with `api = "anthropic"`) |
 | `model` | yes | provider's model id, not your alias |
-| `api` | no | `"openai"` (default, any OpenAI-compatible server) or `"anthropic"` (the native Claude API — see below) |
+| `api` | no | `"openai"` (default, any OpenAI-compatible server), `"anthropic"` (the native Claude API) or `"claude-code"` (a Claude plan via the `claude` CLI) — see below |
+| `effort` | no | reasoning effort, sent in each API's own format: `output_config.effort` (Claude API), `reasoning.effort` (OpenRouter), `reasoning_effort` (other OpenAI-compatible). `minimal`/`low`/`medium`/`high`/`xhigh`/`max`; which levels a model accepts is the provider's call (an unsupported one is its 400, recorded as data). Omit for the model's default. Can't be combined with an `extra_body` that sets the same field |
 | `api_key_env` | no* | env var holding the key |
 | `api_key` | no* | literal key (avoid; use `api_key_env`) |
 | `headers` | no | extra request headers |
@@ -112,13 +113,82 @@ installed and signed in, and to which plan.
 - **Unpriced.** Plan usage has no per-token price; rows land in
   `cost_unpriced`. `fingerprint` doesn't accept CLI targets (no logprobs or
   sampling control).
-- `api_key`, `api_key_env`, `headers`, `extra_body` and `max_tokens_field` don't
-  apply and are rejected (exit 1). `base_url` is ignored, and no `temperature` is
-  sent (`meta.json` records `temperature: null`).
+- `base_url`, `api_key`, `api_key_env`, `headers`, `extra_body` and
+  `max_tokens_field` don't apply and are rejected (exit 1): the CLI decides where
+  requests go. No `temperature` is sent (`meta.json` records `temperature: null`).
+- Before a real run tps checks each CLI's sign-in: signed out exits 2 (missing
+  credentials) before any plan usage is spent.
 
 `[run] temperature` takes a number or `"omit"`. Unset, OpenAI-compatible targets
 get `0` and Claude API targets get nothing; `meta.json` records what each target
 was actually sent.
+
+## ChatGPT plan (`api = "codex"`)
+
+```toml
+[[targets]]
+name = "chatgpt-sol-low"
+api = "codex"
+model = "gpt-6.1-sol"
+effort = "low"            # low … ultra; omit = the model's own default
+```
+
+Or with no file: `tps codex` (your plan's default model) or `tps codex
+gpt-6.1-sol gpt-6-astra -e low,high`.
+
+tps runs the signed-in `codex` client's **app-server** — the protocol Codex's
+own IDE integrations use, and the only Codex interface that streams text as it
+is generated (`codex exec --json` only reports finished messages, which can't
+be timed per token). OpenAI documents ChatGPT sign-in for `codex exec`
+automation; tps identifies itself as `tps`, never as another client, and never
+reads or copies `~/.codex/auth.json`.
+
+- **Your setup is switched off for tps only:** hooks (they would run your
+  scripts on every request), apps, plugins, skills, MCP servers, AGENTS.md,
+  web search and tools. `~/.codex/config.toml` is not modified. The prompt
+  still carries ~5k tokens of Codex's own context; the row's input size says so.
+- **Your preferences don't leak in:** the model's own default effort (from
+  `model/list`) is sent unless you set `effort`, and the **standard** service
+  tier is requested even if your config prefers priority.
+- **No output cap.** Codex can't cap a response, so `--max-tokens` doesn't apply
+  and answers run to their natural length (the box says "no output cap").
+  Warm-ups use a one-word prompt for the same reason.
+- **Hidden model calls are counted.** Codex sometimes makes a model call that
+  shows nothing before the one that streams the answer. `api_calls_median` and
+  a note report it; tok/s is the answering call's rate, and TTFT — to the first
+  answer text — includes the hidden call.
+- **No retries:** Codex can't be told not to retry, so tps records its first
+  error (`willRetry` or not) and stops it. Usage and rate limits are
+  `rate_limited`.
+- **Bursty delivery.** The app-server flushes text in clumps; rows are flagged
+  `bursty` and the ITL column measures the flushing, not the model.
+
+## Grids: models × effort (`[[grids]]`)
+
+One block measures every combination. Each becomes an ordinary target — named
+`<name>/<model>@<effort>`, interleaved like any other, keyed in every statistic:
+
+```toml
+[[grids]]
+name = "claude-plan"
+api = "claude-code"
+models = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]
+effort = ["low", "high"]          # "default" = the model's own level
+```
+
+Every other key (`api`, `base_url`, `api_key_env`, `price`, `cli`, `extra_body`,
+`mock`, …) is shared by the grid's targets; `prices = { "<model>" = { in_per_1m, out_per_1m } }`
+overrides `price` per model. A config can mix `[[targets]]` and `[[grids]]`.
+
+From flags, a comma list does the same: `tps run --api claude-code --model
+claude-opus-5-5,claude-sonnet-5-5 --effort low,high` (and `init` writes the
+`[[grids]]` block).
+
+The terminal groups the results: one model across levels gets a "what effort
+costs" box (TTFT and hidden thinking per level); several models × levels get a
+`tok/s · ttft by effort` matrix. A one-line takeaway appears only when it holds
+for every model measured — tok/s flat across levels, and/or TTFT rising with
+each level.
 
 ## Pinning an upstream
 

@@ -45,6 +45,37 @@ needs a very good reason and a docs update:
 
 [AGENTS.md](AGENTS.md) has the same rules in a denser form.
 
+## Adding a subscription CLI
+
+A plan (Claude, ChatGPT, …) is measured by running the vendor's own client
+headless. Everything vendor-specific is one `CliBackend` subclass in
+`tps/clis.py`; registering it in `BACKENDS` gives you `api = "<api>"`, the
+`tps <command>` shortcut and its `--help`, doctor's sign-in row, plan names in
+titles and spend, grids, and the reports — the timing loop (`core.cli_once`) is
+shared and must not grow vendor branches.
+
+A backend provides:
+
+| Member | What it is |
+|---|---|
+| `api`, `command`, `binary`, `vendor` | config value, shortcut name, executable, word in "<vendor> Max plan" |
+| `efforts`, `default_models`, `model_help`, `example_model`, `examples` | what `--effort` accepts and what `tps <command>` and its help show |
+| `continues_after_cap` | `True` if the client silently sends more requests after a capped response (the loop then stops it at once) |
+| `argv(path, model, effort)` | headless invocation |
+| `session(prompt, model, effort)` | optional: a per-request `CliSession` for clients that speak a protocol. The default writes the prompt to stdin and closes it; Codex's keeps stdin open and answers what it reads (`CliEvent.send`) |
+| `caps_output`, `defaults(path)` | whether `--max-tokens` can be enforced; the models `tps <command>` uses when none are named (Codex asks the plan) |
+| `env(max_tokens)` | the child environment: output cap, **retries off**, and API-key variables **removed** so the plan is what gets measured |
+| `parse(obj)` | one JSON line → `CliEvent` (text, streamed reasoning, Messages-API-shaped usage, finish, end of the response, `final` when the client won't exit by itself, `api_call` per model call, served model, plan-window reading, error) or `None` |
+| `auth(path)` | sign-in, plan and whether it is a subscription; unknown is `signed_in=None` with a reason, never "not signed in" |
+
+Before adding one, check the vendor's **current** terms for headless use of
+that plan, and keep the rules at the top of `tps/clis.py`: never read, store or
+replay plan tokens or impersonate the client; strip the user's setup (tools,
+MCP, project files); measure only the first API call. Test it offline: a fake
+executable that replays the client's recorded JSON (see `FAKE_CLAUDE` and the
+backend-contract check in `tests/selftest.py`), covering a normal answer, hidden
+reasoning, a capped answer, a rate limit, a crash and the sign-in status.
+
 ## Reporting results about real providers
 
 Please don't open issues or PRs that accuse a named provider of serving the

@@ -13,6 +13,7 @@ exit-code and JSON contracts in place. No network egress, no API keys.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import csv
 import json
 import os
@@ -31,7 +32,7 @@ sys.path.insert(0, str(ROOT))
 try:
     import httpx  # noqa: E402
 
-    from tps import core  # noqa: E402
+    from tps import clis, core  # noqa: E402
 except ModuleNotFoundError as exc:
     raise SystemExit(
         f"selftest: `{exc.name}` is not installed — set up the dev environment first "
@@ -399,6 +400,10 @@ import json, os, sys, time
 args = sys.argv[1:]
 if args[:1] == ["--version"]:
     print("9.9.9 (Claude Code)"); sys.exit(0)
+if args[:2] == ["auth", "status"] and os.environ.get("TPS_FAKE_AUTH") == "out":
+    print(json.dumps({"loggedIn": False})); sys.exit(0)
+if args[:2] == ["auth", "status"] and os.environ.get("TPS_FAKE_AUTH") == "broken":
+    print("unknown option --json", file=sys.stderr); sys.exit(2)
 if args[:2] == ["auth", "status"]:
     print(json.dumps({"loggedIn": True, "authMethod": "claude.ai", "subscriptionType": "max",
                       "email": "someone@example.com"})); sys.exit(0)
@@ -415,6 +420,10 @@ def out(obj):
 def ev(event):
     out({"type": "stream_event", "event": event})
 out({"type": "system", "subtype": "init", "tools": []})
+if model == "cc-slow":  # never finishes; records its pid so a test can check it's gone
+    open(os.environ["TPS_FAKE_LOG"] + ".pid", "w").write(str(os.getpid()))
+    ev({"type": "message_start", "message": {"usage": {}}})
+    time.sleep(30); sys.exit(0)
 if model == "cc-crash":
     print("boom: something broke", file=sys.stderr); sys.exit(3)
 if model == "cc-ratelimit":
@@ -423,7 +432,8 @@ if model == "cc-ratelimit":
 time.sleep(0.05)  # client startup
 usage = {"input_tokens": 3, "cache_creation_input_tokens": 500, "cache_read_input_tokens": 0}
 def message(n, stop, think=5):
-    ev({"type": "message_start", "message": {"usage": {**usage, "output_tokens": 1}}})
+    ev({"type": "message_start",
+        "message": {"model": model + "-v9", "usage": {**usage, "output_tokens": 1}}})
     time.sleep(0.05)  # hidden thinking, never streamed
     ev({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}})
     for _ in range(n):
@@ -446,11 +456,75 @@ if model == "cc-capped":
     out({"type": "result", "is_error": True, "result": "exceeded the output token maximum"})
     sys.exit(1)
 message(20, "end_turn")
+if model == "cc-linger":  # a complete answer, then a slow exit
+    time.sleep(3)
 out({"type": "rate_limit_event", "rate_limit_info": {"status": "allowed",
      "rateLimitType": "five_hour",
      "unifiedWindows": {"five_hour": {"utilization": 0.25, "status": "allowed"}}}})
 out({"type": "result", "subtype": "success", "is_error": False,
      "usage": {**usage, "output_tokens": 25, "output_tokens_details": {"thinking_tokens": 5}}})
+"""
+
+
+# A stand-in for `codex app-server`: the JSON-RPC subset tps speaks, replayed
+# from recordings. It never exits on its own, like the real one.
+FAKE_CODEX = r"""
+import json, os, sys, time
+args = sys.argv[1:]
+if args[:1] == ["--version"]:
+    print("codex-cli 9.9.9"); sys.exit(0)
+log = open(os.environ["TPS_FAKE_LOG"] + ".codex", "a")
+log.write(json.dumps({"argv": args, "env": {k: os.environ.get(k) for k in
+                      ("OPENAI_API_KEY", "CODEX_API_KEY")}}) + "\n")
+def out(o): print(json.dumps(o), flush=True)
+def note(method, **params): out({"method": method, "params": params})
+model = None
+for line in sys.stdin:
+    msg = json.loads(line)
+    rid, method, params = msg.get("id"), msg.get("method"), msg.get("params") or {}
+    log.write(json.dumps({"got": method, "params": params}) + "\n"); log.flush()
+    if method == "initialize":
+        out({"id": rid, "result": {"userAgent": "x"}})
+    elif method == "account/read":
+        out({"id": rid, "result": {"account": {"type": "chatgpt", "planType": "plus",
+                                               "email": "someone@example.com"}}})
+    elif method == "model/list":
+        out({"id": rid, "result": {"data": [
+            {"id": "cx-fast", "isDefault": True, "defaultReasoningEffort": "low"},
+            {"id": "cx-hidden", "defaultReasoningEffort": "medium"}]}})
+    elif method == "thread/start":
+        model = params.get("model")
+        out({"id": rid, "result": {"thread": {"id": "th1"}, "model": model + "-served"}})
+    elif method == "turn/start":
+        out({"id": rid, "result": {"turn": {"id": "t1", "status": "inProgress"}}})
+        time.sleep(0.05)  # client startup
+        note("turn/started", threadId="th1", turn={"id": "t1"})
+        if model == "cx-limit":
+            note("error", threadId="th1", turnId="t1", willRetry=True,
+                 error={"message": "You've hit your usage limit", "codexErrorInfo": "usageLimitExceeded"})
+            continue
+        if model == "cx-tool":
+            note("item/started", item={"type": "commandExecution", "id": "c1"})
+            continue
+        def usage(out_tokens, hidden):
+            note("thread/tokenUsage/updated", threadId="th1", turnId="t1", tokenUsage={
+                "total": {}, "last": {"inputTokens": 5000, "cachedInputTokens": 3000,
+                                      "outputTokens": out_tokens, "reasoningOutputTokens": hidden,
+                                      "totalTokens": 0}})
+        if model == "cx-hidden":
+            time.sleep(0.3)
+            usage(400, 50)  # a model call with nothing visible
+        time.sleep(0.05)  # reasoning, announced once done
+        note("item/started", item={"type": "reasoning", "id": "r1"})
+        note("item/started", item={"type": "agentMessage", "id": "m1"})
+        for _ in range(10):
+            note("item/agentMessage/delta", delta="word", itemId="m1", threadId="th1", turnId="t1")
+            time.sleep(0.01)
+        usage(12, 2)
+        note("account/rateLimits/updated", rateLimits={"primary": {"usedPercent": 40,
+             "windowDurationMins": 10080}, "planType": "plus"})
+        note("turn/completed", threadId="th1", turn={"id": "t1", "status": "completed"})
+        # like the real app-server: stays up until it is stopped
 """
 
 
@@ -2171,6 +2245,11 @@ async def main() -> int:
                 f"{fast.plan_utilization} {fast.plan_window} {fast.e2e_s}",
             )
             check(
+                "cli: the model the API says served it is recorded",
+                fast.served_model == "cc-fast-v9",
+                str(fast.served_model),
+            )
+            check(
                 "cli: served_by names the client",
                 fast.served_by == "claude-code",
                 str(fast.served_by),
@@ -2230,6 +2309,96 @@ async def main() -> int:
             check(
                 "cli: stopped before a continuation request",
                 not Path(str(fake_log) + ".continued").exists(),
+            )
+
+            quick = core.RunConfig(targets=[], prompts={}, reps=1, concurrency=[1], timeout_s=1)
+            linger = await core.cli_once(cc("cc-linger"), "hi", "p", 512, quick, 1, 0)
+            check(
+                "cli: a slow exit after a complete answer is not a timeout",
+                linger.ok and linger.error is None,
+                str(linger.error),
+            )
+            task = asyncio.ensure_future(core.cli_once(cc("cc-slow"), "hi", "p", 64, cli_cfg, 1, 0))
+            pid_file = Path(str(fake_log) + ".pid")
+            for _ in range(50):
+                if pid_file.exists():
+                    break
+                await asyncio.sleep(0.1)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            pid = int(pid_file.read_text() or 0)
+            try:
+                os.kill(pid, 0)
+                alive = True
+            except ProcessLookupError:
+                alive = False
+            check(
+                "cli: Ctrl-C/cancel stops the client (no orphan on the plan)", not alive, str(pid)
+            )
+            # The loop must not be Claude-shaped: a made-up client with its own
+            # output format plugs in through a backend alone (as Codex will).
+            other = work / "fake-other"
+            other.write_text(
+                f"#!{sys.executable}\n"
+                "import json, sys, time\n"
+                "sys.stdin.read()\n"
+                "def out(o): print(json.dumps(o), flush=True)\n"
+                "out({'kind': 'begin', 'model': 'other-1'})\n"
+                "for _ in range(10):\n"
+                "    out({'kind': 'text', 'v': 'word'}); time.sleep(0.01)\n"
+                "out({'kind': 'end', 'reason': 'done', 'out': 12, 'in': 7, 'hidden': 2})\n"
+                "out({'kind': 'quota', 'used': 0.3})\n",
+                encoding="utf-8",
+            )
+            other.chmod(0o755)
+
+            class OtherCli(clis.CliBackend):
+                api, command, binary, vendor = "other-cli", "other", "other", "Other"
+                efforts, default_models = ("low",), ("o",)
+                model_help, example_model, examples = "o", "o", (("", "o"),)
+
+                def argv(self, path, model, effort):
+                    return [path, model]
+
+                def env(self, max_tokens):
+                    return dict(os.environ)
+
+                def parse(self, obj):
+                    kind = obj.get("kind")
+                    if kind == "begin":
+                        return clis.CliEvent(stream=True, model=obj["model"])
+                    if kind == "text":
+                        return clis.CliEvent(stream=True, piece=obj["v"])
+                    if kind == "end":
+                        usage = {
+                            "output_tokens": obj["out"],
+                            "input_tokens": obj["in"],
+                            "output_tokens_details": {"thinking_tokens": obj["hidden"]},
+                        }
+                        return clis.CliEvent(stream=True, stop=True, finish="stop", usage=usage)
+                    if kind == "quota":
+                        return clis.CliEvent(plan_window="month", plan_utilization=obj["used"])
+                    return None
+
+                def auth(self, path):
+                    return clis.Auth(signed_in=True, plan="Pro")
+
+            clis.BACKENDS["other-cli"] = OtherCli()
+            try:
+                t = core.Target(name="o", base_url="", model="o", api="other-cli", cli=str(other))
+                done = await core.cli_once(t, "hi", "p", 64, cli_cfg, 1, 0)
+            finally:
+                del clis.BACKENDS["other-cli"]
+            check(
+                "backend contract: a second client works through an adapter alone",
+                done.ok
+                and done.out_tokens == 12
+                and done.hidden_reasoning_tokens == 2
+                and done.served_model == "other-1"
+                and done.plan_utilization == 0.3
+                and done.out_tps is not None,
+                f"{done.ok} {done.error} {done.out_tokens} {done.served_model} {done.plan_utilization}",
             )
 
             limited = await core.cli_once(cc("cc-ratelimit"), "hi", "p", 64, cli_cfg, 1, 0)
@@ -2354,7 +2523,9 @@ async def main() -> int:
             )
             proc = tps(["run", "-c", "effort-http.toml", "--dry-run", "--json"], work)
             check(
-                "cli config: effort on an HTTP target → exit 1", proc.returncode == 1, proc.stdout
+                "cli config: effort on an HTTP target is accepted (sent as reasoning_effort)",
+                proc.returncode == 0,
+                proc.stdout[-300:],
             )
 
             proc = tps(["doctor", "-c", "cc.toml", "--json"], work, env_extra=cli_env)
@@ -2366,6 +2537,37 @@ async def main() -> int:
                 str(cli_row),
             )
             check("doctor: account email never printed", "someone@example.com" not in proc.stdout)
+            proc = tps(
+                ["doctor", "-c", "cc.toml", "--json"],
+                work,
+                env_extra={**cli_env, "TPS_FAKE_AUTH": "broken"},
+            )
+            cli_row = next(
+                (
+                    c
+                    for c in json.loads(proc.stdout or "{}").get("checks", [])
+                    if c["check"].startswith("cli ")
+                ),
+                {},
+            )
+            check(
+                "doctor: unreadable sign-in is 'unknown', not 'not signed in'",
+                "sign-in unknown" in cli_row.get("detail", "")
+                and "not signed in" not in cli_row.get("detail", ""),
+                str(cli_row),
+            )
+            (work / "cc-mockprofile.toml").write_text(
+                cc_toml.replace(str(fake), str(work / "no-such-cli"))
+                + "mock = { ttft = [1, 2] }\n\n"
+                + target_block("real-http", base, "test-model", 'api_key = "good-key"'),
+                encoding="utf-8",
+            )
+            proc = tps(["run", "-c", "cc-mockprofile.toml", "--json"], work)
+            check(
+                "cli run: a mock profile doesn't hide a missing CLI on a real run",
+                proc.returncode == 1 and "CLI not installed" in proc.stdout,
+                proc.stdout[-300:],
+            )
 
             (work / "mixed.toml").write_text(
                 '[run]\nreps = 2\nwarmup = 0\nprompts = ["prose-256"]\nbaseline = "direct"\n\n'
@@ -2408,7 +2610,7 @@ async def main() -> int:
             )
             check(
                 "mixed run: spend line names plan usage",
-                "4 requests on your plan" in screen and "on API" in screen,
+                "4 requests on your Claude plan" in screen and "on API" in screen,
                 screen,
             )
             check(
@@ -2425,6 +2627,571 @@ async def main() -> int:
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
+
+        print("effort and grids:")
+
+        def body_for(api: str, url: str, effort: str | None) -> dict:
+            t = core.Target(name="t", base_url=url, model="m", api=api, effort=effort)
+            return core.request_body(t, cfg, "hi", 32, stream=True)
+
+        check(
+            "effort: Claude API → output_config.effort",
+            body_for("anthropic", base, "high").get("output_config") == {"effort": "high"},
+        )
+        check(
+            "effort: OpenAI-compatible → reasoning_effort",
+            body_for("openai", base, "low").get("reasoning_effort") == "low",
+        )
+        check(
+            "effort: OpenRouter → reasoning.effort",
+            body_for("openai", "https://openrouter.ai/api/v1", "medium").get("reasoning")
+            == {"effort": "medium"},
+        )
+        plain = body_for("openai", base, None)
+        check(
+            "effort: unset sends nothing (the model's default)",
+            not ({"reasoning", "reasoning_effort", "output_config"} & set(plain)),
+            str(plain),
+        )
+        grid_toml = (
+            '[run]\nreps = 1\nwarmup = 0\nprompts = ["prose-256"]\n\n'
+            "[[grids]]\n"
+            'name = "g"\n'
+            f'base_url = "{base}"\n'
+            'api_key = "good-key"\n'
+            'models = ["test-model", "big-chunks"]\n'
+            'effort = ["default", "high"]\n'
+            "price = { in_per_1m = 1, out_per_1m = 2 }\n"
+            'prices = { "big-chunks" = { in_per_1m = 3, out_per_1m = 4 } }\n'
+        )
+        (work / "grid.toml").write_text(grid_toml, encoding="utf-8")
+        grid = core.load_config(work / "grid.toml")
+        check(
+            "grid: one target per model × effort",
+            [t.name for t in grid.targets]
+            == ["g/test-model", "g/test-model@high", "g/big-chunks", "g/big-chunks@high"],
+            str([t.name for t in grid.targets]),
+        )
+        check(
+            "grid: 'default' sends no effort, others do",
+            [t.effort for t in grid.targets] == [None, "high", None, "high"],
+        )
+        check(
+            "grid: per-model prices override the shared price",
+            [t.price_out for t in grid.targets] == [2, 2, 4, 4],
+            str([t.price_out for t in grid.targets]),
+        )
+        for label, broken in (
+            ("grid without a name", grid_toml.replace('name = "g"\n', "")),
+            ("grid with a repeated model", grid_toml.replace('"big-chunks"]', '"test-model"]')),
+            (
+                "grid price for a model it doesn't have",
+                grid_toml.replace('{ "big-chunks"', '{ "x"'),
+            ),
+            (
+                "effort and extra_body both setting it",
+                grid_toml + 'extra_body = { reasoning_effort = "low" }\n',
+            ),
+            ("unknown effort level", grid_toml.replace('"high"]', '"turbo"]')),
+        ):
+            (work / "grid-bad.toml").write_text(broken, encoding="utf-8")
+            proc = tps(["run", "-c", "grid-bad.toml", "--dry-run", "--json"], work)
+            check(f"config: {label} → exit 1", proc.returncode == 1, proc.stdout[-300:])
+        proc = tps(["run", "-c", "grid.toml", "-o", "grid-run", "--json"], work)
+        sent = {BODIES.get(m, {}).get("reasoning_effort") for m in ("test-model", "big-chunks")}
+        check(
+            "grid run: every target measured, effort reached the server",
+            proc.returncode == 0
+            and len(json.loads(proc.stdout or "{}").get("results", [])) == 4
+            and "high" in sent,
+            f"{proc.returncode} {sent} {proc.stdout[-200:]}",
+        )
+        proc = tps(
+            [
+                "run",
+                "--api",
+                "claude-code",
+                "--model",
+                "a,b",
+                "--effort",
+                "low,high",
+                "--dry-run",
+                "--json",
+            ],
+            work,
+        )
+        plan = json.loads(proc.stdout or "{}").get("plan", {})
+        check(
+            "flags: --model a,b --effort low,high → a 4-target grid",
+            [t["target"] for t in plan.get("targets", [])]
+            == [
+                "claude-code/a@low",
+                "claude-code/a@high",
+                "claude-code/b@low",
+                "claude-code/b@high",
+            ],
+            proc.stdout[-300:],
+        )
+        proc = tps(["run", "--api", "claude-code", "--model", "a", "--effort", "turbo"], work)
+        check("flags: unknown --effort → exit 1", proc.returncode == 1, proc.stdout[-200:])
+
+        one = (
+            '[run]\nreps = 2\nwarmup = 0\nprompts = ["prose-256"]\n\n[[grids]]\nname = "x"\n'
+            f'base_url = "{base}"\napi_key = "k"\nmodels = ["atlas"]\n'
+            'effort = ["low", "medium", "high"]\n'
+            "mock = { ttft = [0.40, 0.42], itl = [0.0100, 0.0101] }\n"
+        )
+        (work / "effort-one.toml").write_text(one, encoding="utf-8")
+        screen = tps(
+            ["run", "-c", "effort-one.toml", "--mock", "-o", "e1"],
+            work,
+            env_extra={"COLUMNS": "100"},
+        ).stdout
+        check(
+            "effort view: rows by effort + 'what effort costs' box",
+            "│ effort" in screen and "atlas · what effort costs" in screen,
+            screen,
+        )
+        check(
+            "effort view: thinking said once (box), not per row",
+            "TTFT includes ~" not in screen,
+            screen,
+        )
+        check("effort view: takeaway line", "→ effort barely moves tok/s" in screen, screen)
+        (work / "effort-grid.toml").write_text(
+            one.replace('models = ["atlas"]', 'models = ["atlas", "comet"]'), encoding="utf-8"
+        )
+        screen = tps(
+            ["run", "-c", "effort-grid.toml", "--mock", "-o", "e2"],
+            work,
+            env_extra={"COLUMNS": "100"},
+        ).stdout
+        check(
+            "effort view: several models × levels → one matrix",
+            "tok/s · ttft by effort" in screen and "│ model" in screen,
+            screen,
+        )
+
+        (work / "two-providers.toml").write_text(
+            '[run]\nreps = 2\nwarmup = 0\nprompts = ["prose-256"]\n\n'
+            + "".join(
+                f'[[grids]]\nname = "{p}"\nbase_url = "{base}"\napi_key = "k"\n'
+                f'extra_body = {{ provider = {{ only = ["{p}"] }} }}\n'
+                'models = ["atlas", "comet"]\neffort = ["low", "high"]\n\n'
+                for p in ("prov-a", "prov-b")
+            ),
+            encoding="utf-8",
+        )
+        screen = tps(
+            ["run", "-c", "two-providers.toml", "--mock", "-o", "tp"],
+            work,
+            env_extra={"COLUMNS": "120"},
+        ).stdout
+        check(
+            "matrix: two providers' rows both shown, none overwritten",
+            all(f"{p} · {m}" in screen for p in ("prov-a", "prov-b") for m in ("atlas", "comet")),
+            screen,
+        )
+        (work / "case.toml").write_text(grid_toml.replace('"high"]', '"high", "High"]'))
+        proc = tps(["run", "-c", "case.toml", "--dry-run", "--json"], work)
+        check("grid: effort levels compare case-insensitively", proc.returncode == 1, proc.stdout)
+        proc = tps(
+            [
+                "init",
+                "--api",
+                "claude-code",
+                "--model",
+                "a,b",
+                "--effort",
+                "low,high",
+                "--out",
+                "g4.toml",
+                "--json",
+            ],
+            work,
+        )
+        check(
+            "init: a grid reports how many targets it makes",
+            json.loads(proc.stdout or "{}").get("targets") == 4,
+            proc.stdout,
+        )
+        check(
+            "names: baseten/fast and baseten/turbo stay distinct providers",
+            tps_cli._provider({"target": "baseten/fast", "model": "m", "effort": None})
+            != tps_cli._provider({"target": "baseten/turbo", "model": "m", "effort": None})
+            and tps_cli._provider({"target": "g/m@high", "model": "m", "effort": "high"}) == "g",
+        )
+        usage = core.plan_usage(
+            [
+                {
+                    "target": "p",
+                    "batch": 0,
+                    "wall_clock": "1",
+                    "plan_window": "five_hour",
+                    "plan_utilization": 0.06,
+                },
+                {
+                    "target": "p",
+                    "batch": 1,
+                    "wall_clock": "2",
+                    "plan_window": "seven_day",
+                    "plan_utilization": 0.40,
+                },
+                {
+                    "target": "p",
+                    "batch": 2,
+                    "wall_clock": "3",
+                    "plan_window": "seven_day",
+                    "plan_utilization": 0.41,
+                },
+                {"target": "p", "batch": -1, "phase": "warmup"},
+            ],
+            {"targets": [{"name": "p", "access": "cli"}]},
+        )
+        check(
+            "plan usage: one window only, measured requests only",
+            usage[0]["window"] == "seven_day"
+            and (usage[0]["utilization_first"], usage[0]["utilization_last"]) == (0.40, 0.41)
+            and usage[0]["requests"] == 3,
+            str(usage),
+        )
+
+        def row(model, effort, tps_, ttft):
+            return {
+                "model": model,
+                "effort": effort,
+                "out_tps_p50": tps_,
+                "ttft_p50_s": ttft,
+                "concurrency": 1,
+                "by_concurrency": {"1": {"reasoning_only": 0}},
+            }
+
+        from tps import cli as tps_cli
+
+        flat = [row("a", "low", 100, 1.0), row("a", "high", 98, 3.0)]
+        check(
+            "takeaway: says it when it holds",
+            tps_cli.effort_takeaway(flat)
+            == "effort barely moves tok/s (≤2%) · it costs ttft: +2.0s from low to high",
+            str(tps_cli.effort_takeaway(flat)),
+        )
+        mixed_up = [row("a", "low", 100, 3.0), row("a", "high", 70, 1.0)]
+        check(
+            "takeaway: silent when it doesn't hold for every row",
+            tps_cli.effort_takeaway(mixed_up) is None,
+            str(tps_cli.effort_takeaway(mixed_up)),
+        )
+
+        print("tps claude:")
+        for flag in ("-h", "--help", "--h"):
+            proc = tps(["claude", flag], work)
+            check(
+                f"claude {flag}: help with examples, exit 0",
+                proc.returncode == 0 and "tps claude opus sonnet -e low,high" in proc.stdout,
+                proc.stdout[-200:] + proc.stderr[-200:],
+            )
+        proc = tps(["claude", "--dry-run", "--json"], work)
+        plan = json.loads(proc.stdout or "{}").get("plan", {})
+        check(
+            "claude: defaults to opus, sonnet, haiku",
+            [t["target"] for t in plan.get("targets", [])]
+            == ["claude-code/opus", "claude-code/sonnet", "claude-code/haiku"],
+            proc.stdout[-300:],
+        )
+        proc = tps(["claude", "opus", "-e", "all", "--dry-run", "--json"], work)
+        plan = json.loads(proc.stdout or "{}").get("plan", {})
+        check(
+            "claude: -e all → every effort level",
+            len(plan.get("targets", [])) == len(core.EFFORTS),
+            proc.stdout[-300:],
+        )
+        proc = tps(["claude", "opus", "sonnet", "-e", "low,high", "--mock", "--json"], work)
+        out = json.loads(proc.stdout or "{}")
+        check(
+            "claude: runs like `run` (same JSON), never prompts off a terminal",
+            proc.returncode == 0
+            and out.get("command") == "run"
+            and len(out.get("results", [])) == 4,
+            proc.stdout[-300:] + proc.stderr[-300:],
+        )
+        proc = tps(["claude", "opus", "--mock", "-o", "cl"], work, env_extra={"COLUMNS": "100"})
+        check("claude: header names the command", "tps claude" in proc.stdout, proc.stdout[:300])
+
+        print("codex backend (fake app-server):")
+        fake_codex = work / "fake-codex"
+        fake_codex.write_text(f"#!{sys.executable}\n{FAKE_CODEX}", encoding="utf-8")
+        fake_codex.chmod(0o755)
+        codex_log = Path(str(fake_log) + ".codex")
+        os.environ.update(cli_env, OPENAI_API_KEY="sk-should-be-stripped")
+        try:
+
+            def cx(model: str, **kw) -> core.Target:
+                return core.Target(
+                    name=model, base_url="", model=model, api="codex", cli=str(fake_codex), **kw
+                )
+
+            started = time.perf_counter()
+            fast = await core.cli_once(cx("cx-fast"), "hi", "p", 512, cli_cfg, 1, 0)
+            took = time.perf_counter() - started
+            check("codex: ok", fast.ok, str(fast.error))
+            check(
+                "codex: tokens from the answering call's usage",
+                fast.out_tokens == 12
+                and fast.hidden_reasoning_tokens == 2
+                and fast.in_tokens == 5000,
+                f"{fast.out_tokens} {fast.hidden_reasoning_tokens} {fast.in_tokens}",
+            )
+            check("codex: tok/s measured from deltas", fast.out_tps is not None, str(fast.out_tps))
+            check(
+                "codex: startup is client startup (turn started), not model thinking",
+                fast.startup_s is not None and fast.startup_s < fast.ttft_s,
+                f"{fast.startup_s} {fast.ttft_s}",
+            )
+            check(
+                "codex: a server that never exits is stopped at turn/completed",
+                took < 5,
+                f"{took:.1f}s",
+            )
+            check(
+                "codex: plan window read (7-day, 40%)",
+                fast.plan_window == "seven_day" and fast.plan_utilization == 0.4,
+                f"{fast.plan_window} {fast.plan_utilization}",
+            )
+            check("codex: served model recorded", fast.served_model == "cx-fast-served")
+            sent = [json.loads(line) for line in codex_log.read_text().splitlines()]
+            turn = next(e for e in reversed(sent) if e.get("got") == "turn/start")["params"]
+            thread = next(e for e in reversed(sent) if e.get("got") == "thread/start")["params"]
+            boot = next(e for e in reversed(sent) if "argv" in e)
+            init = next(e for e in reversed(sent) if e.get("got") == "initialize")["params"]
+            check(
+                "codex: default effort is the model's own (from model/list), not the user's",
+                turn.get("effort") == "low",
+                str(turn.get("effort")),
+            )
+            check(
+                "codex: standard service tier, stripped instructions, read-only, ephemeral",
+                thread.get("serviceTier") == "default"
+                and thread.get("sandbox") == "read-only"
+                and thread.get("ephemeral") is True
+                and "cwd" not in thread
+                and len(thread.get("baseInstructions") or "") < 80,
+                str(thread),
+            )
+            check(
+                "codex: identifies as tps, never as another client",
+                init["clientInfo"]["name"] == "tps",
+                str(init),
+            )
+            check(
+                "codex: hooks, apps, plugins and MCP off; API key stripped",
+                all(f in boot["argv"] for f in ("hooks", "apps", "plugins", "mcp_servers={}"))
+                and boot["env"]["OPENAI_API_KEY"] is None,
+                str(boot),
+            )
+            high = await core.cli_once(cx("cx-fast", effort="high"), "hi", "p", 512, cli_cfg, 1, 0)
+            sent = [json.loads(line) for line in codex_log.read_text().splitlines()]
+            turn = next(e for e in reversed(sent) if e.get("got") == "turn/start")["params"]
+            check(
+                "codex: an explicit effort is sent as is",
+                high.ok and turn.get("effort") == "high",
+                str(turn),
+            )
+            hidden = await core.cli_once(cx("cx-hidden"), "hi", "p", 512, cli_cfg, 1, 0)
+            check(
+                "codex: hidden earlier call counted; usage is the answering call's",
+                hidden.ok and hidden.api_calls == 2 and hidden.out_tokens == 12,
+                f"{hidden.api_calls} {hidden.out_tokens}",
+            )
+            started = time.perf_counter()
+            limit = await core.cli_once(cx("cx-limit"), "hi", "p", 512, cli_cfg, 1, 0)
+            check(
+                "codex: usage limit → rate_limited at once, no waiting on its retries",
+                (limit.error or "").startswith("rate_limited")
+                and limit.status == 429
+                and time.perf_counter() - started < 5,
+                str(limit.error),
+            )
+            tool = await core.cli_once(cx("cx-tool"), "hi", "p", 512, cli_cfg, 1, 0)
+            check(
+                "codex: a tool call is an error, not a timed answer",
+                not tool.ok and "tool" in (tool.error or ""),
+                str(tool.error),
+            )
+            backend = clis.backend("codex")
+            auth = backend.auth(str(fake_codex))
+            check(
+                "codex: sign-in and plan from account/read",
+                auth.signed_in and auth.plan == "Plus" and auth.subscription,
+                str(auth),
+            )
+            check(
+                "codex: `tps codex` defaults to the plan's default model",
+                backend.defaults(str(fake_codex)) == (("cx-fast",), ""),
+                str(backend.defaults(str(fake_codex))),
+            )
+            (work / "cx.toml").write_text(
+                '[run]\nreps = 1\nwarmup = 1\nprompts = ["prose-256"]\n\n'
+                f'[[targets]]\nname = "cx"\napi = "codex"\nmodel = "cx-fast"\ncli = "{fake_codex}"\n',
+                encoding="utf-8",
+            )
+            proc = tps(
+                ["run", "-c", "cx.toml", "-o", "cx-run"],
+                work,
+                env_extra={**cli_env, "COLUMNS": "120"},
+            )
+            check(
+                "codex run: plan box says ChatGPT and 'no output cap'",
+                proc.returncode == 0
+                and "ChatGPT Plus plan" in proc.stdout
+                and "no output cap" in proc.stdout,
+                proc.stdout[-600:] + proc.stderr[-300:],
+            )
+            sent = [json.loads(line) for line in codex_log.read_text().splitlines()]
+            prompts = [
+                e["params"]["input"][0]["text"] for e in sent if e.get("got") == "turn/start"
+            ]
+            check(
+                "codex run: the warm-up asks for one word (no cap to keep it short)",
+                core.WARMUP_UNCAPPED_PROMPT in prompts[-2:],
+                str(prompts[-2:]),
+            )
+            proc = tps(["doctor", "-c", "cx.toml", "--json"], work, env_extra=cli_env)
+            row = next(
+                (
+                    c
+                    for c in json.loads(proc.stdout or "{}").get("checks", [])
+                    if c["check"].startswith("cli ")
+                ),
+                {},
+            )
+            check(
+                "codex doctor: signed in, plan shown, email never printed",
+                row.get("ok")
+                and "plus" in row.get("detail", "")
+                and "someone@example.com" not in proc.stdout,
+                str(row),
+            )
+            # review fixes, each pinned
+            proc = tps(["run", "-c", "cx.toml", "-o", "cx-run2"], work, env_extra=cli_env)
+            text = codex_log.read_text()
+            runs = [chunk for chunk in text.split('{"argv"') if '"turn/start"' in chunk]
+            check(
+                "codex: default effort resolved before the run, never inside a timed request",
+                runs and all('"model/list"' not in chunk for chunk in runs[-2:]),
+                str([chunk.count("model/list") for chunk in runs[-2:]]),
+            )
+            session = clis.CodexSession(backend, "hi", "m", "low")
+            same = {"tokenUsage": {"last": {"inputTokens": 1, "outputTokens": 2}}}
+            counts = [
+                session.parse({"method": "thread/tokenUsage/updated", "params": same}).api_call
+                for _ in range(2)
+            ]
+            check(
+                "codex: a repeated usage update is not a second model call", counts == [True, False]
+            )
+            empty = work / "empty-path"
+            empty.mkdir(exist_ok=True)
+            no_codex = {"PATH": str(empty)}
+            proc = tps(["codex", "--dry-run", "--json"], work, env_extra=no_codex)
+            plan = json.loads(proc.stdout or "{}").get("plan", {})
+            check(
+                "codex --dry-run: asks the plan nothing (works without codex installed)",
+                proc.returncode == 0 and len(plan.get("targets", [])) == 1,
+                proc.stdout[-300:] + proc.stderr[-300:],
+            )
+            proc = tps(["codex", "-y", "--json"], work, env_extra=no_codex)
+            check(
+                "codex: an unreadable default model is an error, never a guess",
+                proc.returncode == 1 and "default model" in proc.stdout,
+                proc.stdout[-300:],
+            )
+            proc = tps(["codex", "m", "-e", "all", "--mock", "--json"], work)
+            check(
+                "codex: -e all (incl. ultra) renders without crashing",
+                proc.returncode == 0
+                and len(json.loads(proc.stdout or "{}").get("results", [])) == 6,
+                proc.stdout[-300:] + proc.stderr[-300:],
+            )
+            proc = tps(
+                ["run", "-c", "cc.toml", "--json"],
+                work,
+                env_extra={**cli_env, "TPS_FAKE_AUTH": "out"},
+            )
+            check(
+                "cli: signed out → exit 2 (missing credentials) before anything is sent",
+                proc.returncode == 2 and "not signed in" in proc.stdout,
+                proc.stdout[-300:],
+            )
+            (work / "cc-baseurl.toml").write_text(
+                cc_toml + 'base_url = "https://proxy.internal/v1"\n', encoding="utf-8"
+            )
+            proc = tps(["run", "-c", "cc-baseurl.toml", "--dry-run", "--json"], work)
+            check(
+                "cli config: base_url on a CLI target → exit 1", proc.returncode == 1, proc.stdout
+            )
+            check(
+                "claude: one stop-reason map for HTTP and CLI",
+                core.ANTHROPIC_STOP is clis.ANTHROPIC_STOP
+                and clis.ANTHROPIC_STOP["tool_use"] == "tool_calls",
+            )
+            usage = core.plan_usage(
+                [
+                    {
+                        "target": "a",
+                        "batch": 0,
+                        "wall_clock": "2026-11-02T10:00:00+00:00",
+                        "e2e_s": 1,
+                        "plan_window": "five_hour",
+                        "plan_utilization": 0.92,
+                    },
+                    {
+                        "target": "a",
+                        "batch": 1,
+                        "wall_clock": "2026-11-02T10:01:00+00:00",
+                        "e2e_s": 1,
+                        "plan_window": "five_hour",
+                        "plan_utilization": 0.03,
+                    },
+                    {
+                        "target": "b",
+                        "batch": 0,
+                        "wall_clock": "2026-11-02T10:00:30+00:00",
+                        "e2e_s": 1,
+                        "plan_window": "five_hour",
+                        "plan_utilization": 0.60,
+                    },
+                ],
+                {
+                    "targets": [
+                        {"name": "a", "access": "cli", "api": "claude-code"},
+                        {"name": "b", "access": "cli", "api": "codex"},
+                    ]
+                },
+            )
+            claude_u = next(u for u in usage if u["api"] == "claude-code")
+            codex_u = next(u for u in usage if u["api"] == "codex")
+            check(
+                "plan usage: one entry per plan, never pooled across clients",
+                len(usage) == 2
+                and codex_u["utilization_first"] == codex_u["utilization_last"] == 0.60,
+                str(usage),
+            )
+            check(
+                "plan usage: first → last in reporting order; a rollover is marked",
+                (claude_u["utilization_first"], claude_u["utilization_last"]) == (0.92, 0.03)
+                and claude_u["reset"],
+                str(claude_u),
+            )
+            proc = tps(["codex", "--help"], work)
+            check(
+                "codex: `tps codex --help` with examples",
+                "tps codex -e" in proc.stdout or "tps codex gpt" in proc.stdout,
+                proc.stdout[-300:],
+            )
+        finally:
+            os.environ.pop("OPENAI_API_KEY", None)
+            for key in cli_env:
+                os.environ.pop(key, None)
 
         print("report provenance:")
         (work / "unknown_rate.toml").write_text(

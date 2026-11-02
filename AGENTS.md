@@ -40,6 +40,7 @@ tps discover    MODEL [--out FILE] [--from-json F] [--json-out F]
 tps run         [-c FILE] [-o DIR] [--reps N] [--concurrency 1,4] [--prompts a,b]
                 [--max-tokens N] [--temperature T] [--timeout S] [--dry-run] [--mock]
 tps run         --base-url URL --model ID [--api-key-env VAR] [--price IN,OUT] [...]
+tps claude      [MODEL ...] [-e LEVELS|all] [-n REPS] [--dry-run] [-y] [--mock]
 tps report      RUN_DIR [--markdown]
 tps fingerprint [-c FILE] [--reps N] [--prompt-count N] [--max-tokens N] [--timeout S] [--mock]
 ```
@@ -51,7 +52,18 @@ effective settings (overrides included), and never replaces a different
 `--api anthropic` (or `api = "anthropic"` on a target) uses the native Claude
 Messages API with an API key; it sends no `temperature` (Claude 4.7+ 400s on it)
 and keeps hidden thinking out of tok/s. A Claude **subscription** is measured with
-`--api claude-code --model ID [--effort low|medium|high|xhigh|max]` (or
+Subscription CLIs are adapters in `tps/clis.py` (`CliBackend`; see
+CONTRIBUTING.md → Adding a subscription CLI); the loop in `core.cli_once` is
+shared — never add vendor branches to it.
+`tps codex [MODEL …] [-e …]` does the same for ChatGPT plans via `codex
+app-server` (no output cap; hidden extra model calls reported as
+`api_calls_median`).
+`tps claude [opus sonnet haiku] [-e low,high]` is the short form: it runs
+exactly `run --api claude-code` (same JSON, `command: "run"`), defaults to
+opus/sonnet/haiku, 5 reps, `--max-tokens 2048`, and asks before running only on
+a terminal — agents get no prompt. Rows carry `served_models` (the id an alias
+resolved to). Long form:
+`--api claude-code --model ID[,ID] [--effort low,high]` (or
 `api = "claude-code"`): tps runs the signed-in `claude` CLI headless — no URL,
 key or price. Never extract or replay plan OAuth tokens over HTTP: Anthropic
 answers them with `429 rate_limit_error`, and impersonating its client is not
@@ -157,7 +169,10 @@ reasoning off on OpenRouter; a target that spent the budget reasoning anyway is
 `no_data` with `reasoning_consumed_budget`.
 `doctor` adds `checks[]` with `{check, ok, detail, critical}`; CLI targets add a
 `cli <binary>` check (installed, signed in, plan — never the account email).
-Rows also carry `api`, `access` (`http`|`cli`), `effort` and `plan` (the
+`effort` works on every target (Claude API `output_config.effort`, OpenRouter
+`reasoning.effort`, else `reasoning_effort`); `[[grids]]` (or comma lists in
+`--model`/`--effort`) expand to one target per model × effort, named
+`<grid>/<model>@<effort>`. Rows also carry `api`, `access` (`http`|`cli`), `effort` and `plan` (the
 signed-in plan, e.g. `"Max"`, when the CLI reports it); samples in `raw.jsonl`
 carry `plan_utilization`/`plan_window` from the CLI's rate-limit events. The
 terminal shows one box per access mode (CLI TTFT is never ranked against HTTP
