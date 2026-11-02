@@ -159,18 +159,34 @@ def cli_checks(cfg: core.RunConfig) -> list[tuple[str, str, bool]]:
     return rows
 
 
-def label_plans(cfg: core.RunConfig) -> None:
-    """Name the plan each CLI target is signed in to ("Max"), for headers and
-    reports. An unreadable status just leaves it unnamed ("Claude plan")."""
-    cache: dict[str, str | None] = {}
+def prepare_clis(cfg: core.RunConfig) -> None:
+    """Before a real run: check each CLI's sign-in, name its plan, and let the
+    backend resolve what requests would otherwise look up while being timed.
+
+    Signed out → MissingKeyError (exit 2: ask the human), before any plan usage
+    is spent. Unknown sign-in doesn't block; the plan just stays unnamed.
+    """
+    by_path: dict[str, list[core.Target]] = {}
     for target in cfg.targets:
         path = target.cli_path() if target.is_cli else None
-        if not path:
+        if path:
+            by_path.setdefault(path, []).append(target)
+    signed_out = []
+    for path, targets in by_path.items():
+        backend = targets[0].backend
+        auth = backend.auth(path)
+        if auth.signed_in is False:
+            signed_out.append(f"`{targets[0].cli_binary()}` ({', '.join(t.name for t in targets)})")
             continue
-        if path not in cache:
-            auth = target.backend.auth(path)
-            cache[path] = auth.plan if auth.signed_in and auth.subscription else None
-        target.plan = cache[path]
+        plan = auth.plan if auth.signed_in and auth.subscription else None
+        for target in targets:
+            target.plan = plan
+        backend.prepare(path, targets)
+    if signed_out:
+        raise core.MissingKeyError(
+            f"not signed in: {'; '.join(signed_out)} — sign in with that CLI first "
+            "(`tps doctor` shows which)"
+        )
 
 
 def plan_title(rows: list[dict[str, Any]]) -> str:
@@ -466,8 +482,11 @@ def print_run_table(ui: UI, summary: dict[str, Any], prompt: str) -> None:
 
 
 def _effort_rank(effort: str | None) -> int:
-    """`default` (None) first, then low → max."""
-    return -1 if effort is None else core.EFFORTS_HTTP.index(effort)
+    """`default` (None) first, then minimal → ultra; an unknown level sorts last."""
+    if effort is None:
+        return -1
+    order = core.EFFORT_ORDER
+    return order.index(effort) if effort in order else len(order)
 
 
 def _efforts(rows: list[dict[str, Any]]) -> list[str | None]:
@@ -925,17 +944,22 @@ def attach_cost(summary: dict[str, Any], cost: dict[str, Any]) -> None:
 
 
 def _plan_spend(cost: dict[str, Any]) -> str | None:
-    """ "Claude Max plan: 12 requests, 5-hour window 6% → 9%" for CLI targets."""
-    plan = cost.get("plan")
-    if not plan:
-        return None
-    name = f"{plan['plans'][0]} plan" if len(plan["plans"]) == 1 else "plan"
-    text = f"{_n(plan['requests'], 'request')} on your {name}"
-    first, last = plan["utilization_first"], plan["utilization_last"]
-    if first is not None and last is not None:
-        window = {"five_hour": "5-hour", "seven_day": "7-day"}.get(plan["window"], "usage")
-        text += f", {window} window {first:.0%} → {last:.0%}"
-    return text
+    """ "12 requests on your Claude Max plan, 5-hour window 6% → 9%" per plan."""
+    parts = []
+    for plan in cost.get("plan") or []:
+        vendor = clis.backend(plan["api"]).vendor if plan["api"] in clis.BACKENDS else ""
+        name = " ".join(
+            x for x in (vendor, plan["plans"][0] if len(plan["plans"]) == 1 else "") if x
+        )
+        text = f"{_n(plan['requests'], 'request')} on your {name + ' ' if name else ''}plan"
+        first, last = plan["utilization_first"], plan["utilization_last"]
+        if first is not None and last is not None:
+            window = {"five_hour": "5-hour", "seven_day": "7-day"}.get(plan["window"], "usage")
+            text += f", {window} window {first:.0%} → {last:.0%}"
+            if plan.get("reset"):
+                text += " (reset during the run)"
+        parts.append(text)
+    return " · ".join(parts) or None
 
 
 def print_spend(ui: UI, cost: dict[str, Any]) -> None:
@@ -1449,7 +1473,7 @@ def cmd_run(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
         path.write_text(text, encoding="utf-8")
     total = core.planned_requests(cfg)
     if not args.mock:
-        label_plans(cfg)
+        prepare_clis(cfg)
     ui.header(
         getattr(args, "label", "run"),
         _models_label(cfg),
@@ -1544,7 +1568,21 @@ def cmd_plan(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
     exit codes match `run`.
     """
     backend = clis.backend(args.backend_api)
-    named = args.models or backend.defaults(shutil.which(backend.binary))
+    named = args.models
+    if not named and (args.mock or args.dry_run) and not backend.default_models:
+        # nothing is sent in a dry run or under --mock: don't ask the plan
+        named = [backend.example_model]
+        ui.warn(
+            f"no model named — showing {backend.example_model}; a real run uses "
+            "your plan's default model"
+        )
+    if not named:
+        named, why = backend.defaults(shutil.which(backend.binary))
+        if not named:
+            raise core.UsageError(
+                f"couldn't read your plan's default model ({why}) — name one, "
+                f"e.g. tps {backend.command} {backend.example_model}"
+            )
     models = [m for arg in named for m in arg.split(",") if m]
     efforts = None
     if args.effort:

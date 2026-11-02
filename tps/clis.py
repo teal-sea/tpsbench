@@ -104,9 +104,14 @@ class CliBackend:
     def session(self, prompt: str, model: str, effort: str | None) -> CliSession:
         return CliSession(self, prompt, model, effort)
 
-    def defaults(self, path: str | None) -> tuple[str, ...]:
-        """The models `tps <command>` measures when none are named."""
-        return self.default_models
+    def defaults(self, path: str | None) -> tuple[tuple[str, ...], str]:
+        """The models `tps <command>` measures when none are named → (models,
+        "") or ((), why they couldn't be read)."""
+        return self.default_models, ""
+
+    def prepare(self, path: str, targets: list[Any]) -> None:
+        """Once before a real run, untimed: resolve anything a request would
+        otherwise look up inside its timing (Codex: each model's default effort)."""
 
     def argv(self, path: str, model: str, effort: str | None) -> list[str]:
         raise NotImplementedError
@@ -151,7 +156,13 @@ CLAUDE_SYSTEM_PROMPT = "You are a helpful assistant."
 # credentials a child `claude` would prefer over the signed-in plan (`-p` uses an
 # API key whenever one is set); dropped so the plan is what gets measured
 CLAUDE_STRIP_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
-ANTHROPIC_STOP = {"max_tokens": "length", "end_turn": "stop", "stop_sequence": "stop"}
+# Claude stop reasons in OpenAI's vocabulary, so one report covers HTTP and CLI
+ANTHROPIC_STOP = {
+    "max_tokens": "length",
+    "end_turn": "stop",
+    "stop_sequence": "stop",
+    "tool_use": "tool_calls",
+}
 
 
 class ClaudeCode(CliBackend):
@@ -348,11 +359,24 @@ class Codex(CliBackend):
     def parse(self, obj: dict[str, Any]) -> CliEvent | None:  # pragma: no cover - via session
         return None
 
-    def defaults(self, path: str | None) -> tuple[str, ...]:
-        models, _why = codex_query(path or self.binary, ["model/list"])
-        listed = ((models or {}).get("model/list") or {}).get("data") or []
+    def defaults(self, path: str | None) -> tuple[tuple[str, ...], str]:
+        got, why = codex_query(path or self.binary, ["model/list"])
+        listed = ((got or {}).get("model/list") or {}).get("data") or []
         default = [m.get("id") for m in listed if m.get("isDefault") and m.get("id")]
-        return tuple(default[:1]) or (self.example_model,)
+        if default:
+            return tuple(default[:1]), ""
+        return (), why or "the plan lists no default model"
+
+    def prepare(self, path: str, targets: list[Any]) -> None:
+        unresolved = [t for t in targets if not t.effort]
+        if not unresolved:
+            return
+        got, _why = codex_query(path, ["model/list"])
+        listed = ((got or {}).get("model/list") or {}).get("data") or []
+        for target in unresolved:
+            mine = next((m for m in listed if target.model in (m.get("id"), m.get("model"))), {})
+            # unknown here → the session asks model/list itself (inside timing)
+            target.default_effort = mine.get("defaultReasoningEffort")
 
     def auth(self, path: str) -> Auth:
         got, why = codex_query(path, ["account/read"])
@@ -387,6 +411,7 @@ class CodexSession(CliSession):
         super().__init__(backend, prompt, model, effort)
         self.thread: str | None = None
         self.turn_effort = effort  # None until model/list names the model's default
+        self.last_usage: dict[str, Any] | None = None
 
     def opening(self) -> list[dict[str, Any]]:  # type: ignore[override]
         info = {"name": "tps", "version": _version()}
@@ -458,7 +483,10 @@ class CodexSession(CliSession):
                 "output_tokens": last.get("outputTokens"),
                 "output_tokens_details": {"thinking_tokens": last.get("reasoningOutputTokens")},
             }
-            return CliEvent(stream=True, api_call=True, usage=usage)
+            # a call is counted when its usage first appears, not per update
+            changed = last != self.last_usage
+            self.last_usage = last
+            return CliEvent(stream=True, api_call=changed, usage=usage)
         if method == "account/rateLimits/updated":
             limits = params.get("rateLimits") or {}
             window = limits.get("primary") or {}

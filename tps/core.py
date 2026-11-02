@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import csv
+import functools
 import json
 import math
 import os
@@ -79,6 +80,8 @@ EFFORTS = ("low", "medium", "high", "xhigh", "max")
 # HTTP APIs: what each provider accepts varies by model (OpenAI also has
 # "minimal"); an unsupported level is the provider's 400, recorded as data
 EFFORTS_HTTP = ("minimal", *EFFORTS)
+# display order for every level any API or client accepts (Codex adds "ultra")
+EFFORT_ORDER = ("minimal", *EFFORTS, "ultra")
 # where effort goes in each API's request body; extra_body may not also set it
 EFFORT_FIELDS = {
     "anthropic": "output_config",
@@ -89,12 +92,7 @@ EFFORT_FIELDS = {
 # config load); dry-run budgets it per request
 PLAN_CLI_STARTUP_S = 2.0
 # Claude API stop reasons in OpenAI's vocabulary, so one report covers both
-ANTHROPIC_STOP = {
-    "max_tokens": "length",
-    "end_turn": "stop",
-    "stop_sequence": "stop",
-    "tool_use": "tool_calls",
-}
+ANTHROPIC_STOP = clis.ANTHROPIC_STOP
 # request fields tps sets itself; overriding them in extra_body would silently
 # change what is measured (and what --dry-run budgets for)
 RESERVED_BODY = ("model", "messages", "stream", "max_tokens", "max_completion_tokens")
@@ -214,6 +212,14 @@ def is_local(url: str) -> bool:
         return False
 
 
+@functools.cache
+def _which(name: str) -> str | None:
+    binary = os.path.expanduser(name)
+    if os.sep in binary:
+        return binary if os.access(binary, os.X_OK) else None
+    return shutil.which(binary)
+
+
 @dataclass
 class Target:
     name: str
@@ -237,6 +243,9 @@ class Target:
     cli: str | None = None
     # CLI targets: the plan the CLI is signed in to ("max"), when it says
     plan: str | None = None
+    # CLI targets with no `effort`: the model's own default, resolved once before
+    # the run (so no timed request pays for looking it up); still reported as default
+    default_effort: str | None = None
 
     @property
     def is_cli(self) -> bool:
@@ -251,10 +260,7 @@ class Target:
 
     def cli_path(self) -> str | None:
         """Absolute path of the CLI to spawn, or None when it isn't installed."""
-        binary = os.path.expanduser(self.cli_binary())
-        if os.sep in binary:
-            return binary if os.access(binary, os.X_OK) else None
-        return shutil.which(binary)
+        return _which(self.cli_binary())
 
     def effort_field(self) -> str | None:
         """The request field that carries `effort`; None for CLI targets."""
@@ -526,7 +532,14 @@ def config_from_dict(raw: dict[str, Any], path: Path) -> RunConfig:
         if api in CLI_APIS:
             unsupported = sorted(
                 k
-                for k in ("api_key", "api_key_env", "headers", "extra_body", "max_tokens_field")
+                for k in (
+                    "base_url",
+                    "api_key",
+                    "api_key_env",
+                    "headers",
+                    "extra_body",
+                    "max_tokens_field",
+                )
                 if entry.get(k)
             )
             if unsupported:
@@ -1026,7 +1039,11 @@ def cli_workdir() -> str:
     state on the working directory, and a fresh temp dir would add an entry
     every run."""
     base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
-    path = os.path.join(base, "tps", "cli-workdir")
+    return _workdir(os.path.join(base, "tps", "cli-workdir"))
+
+
+@functools.cache
+def _workdir(path: str) -> str:
     os.makedirs(path, mode=0o700, exist_ok=True)
     return path
 
@@ -1064,7 +1081,7 @@ async def cli_once(
     the cap is a real per-request cap and no extra plan usage is spent.
     """
     backend = target.backend
-    session = backend.session(prompt_text, target.model, target.effort)
+    session = backend.session(prompt_text, target.model, target.effort or target.default_effort)
     sample = Sample(
         target=target.name,
         prompt=prompt_name,
@@ -1900,33 +1917,50 @@ def spend(samples: list[dict[str, Any]], meta: dict[str, Any]) -> dict[str, Any]
     }
 
 
-def plan_usage(samples: list[dict[str, Any]], meta: dict[str, Any]) -> dict[str, Any] | None:
-    """What CLI targets drew from subscription plans: measured requests, and the
-    utilization of one usage window as the client reported it during the run
-    (lowest → highest reading; warm-ups count, since they draw on it too).
+def plan_usage(samples: list[dict[str, Any]], meta: dict[str, Any]) -> list[dict[str, Any]]:
+    """What CLI targets drew from subscription plans, one entry per client (a
+    Claude plan and a ChatGPT plan are different accounts with different windows).
 
-    Readings are never compared across windows: the window is the one reported
-    most recently, and only its readings are used. None without CLI targets.
+    Readings are taken in the order they were reported (request start + its
+    duration), within the window the client reported last — never compared
+    across windows or across plans. `reset` marks a window that rolled over
+    during the run (the last reading is lower than the first). Warm-ups draw on
+    the plan too, so their readings count; `requests` counts measured ones.
     """
-    cli = {t.get("name") for t in meta.get("targets", []) if t.get("access") == "cli"}
-    if not cli:
-        return None
-    mine = [s for s in samples if s.get("target") in cli]
-    readings = [
-        (s.get("wall_clock") or "", s["plan_window"], s["plan_utilization"])
-        for s in mine
-        if s.get("plan_utilization") is not None and s.get("plan_window")
-    ]
-    window = max(readings)[1] if readings else None
-    levels = [u for _t, w, u in readings if w == window]
-    plans = sorted({t.get("plan") for t in meta["targets"] if t.get("name") in cli} - {None})
-    return {
-        "requests": sum(1 for s in mine if not is_warmup(s)),
-        "plans": plans,
-        "window": window,
-        "utilization_first": min(levels) if levels else None,
-        "utilization_last": max(levels) if levels else None,
-    }
+    targets = [t for t in meta.get("targets", []) if t.get("access") == "cli"]
+    out = []
+    for api in dict.fromkeys(t.get("api") for t in targets):
+        names = {t.get("name") for t in targets if t.get("api") == api}
+        mine = [s for s in samples if s.get("target") in names]
+        readings = sorted(
+            (_reported_at(s), s["plan_window"], s["plan_utilization"])
+            for s in mine
+            if s.get("plan_utilization") is not None and s.get("plan_window")
+        )
+        window = readings[-1][1] if readings else None
+        levels = [u for _t, w, u in readings if w == window]
+        plans = sorted({t.get("plan") for t in targets if t.get("name") in names} - {None})
+        out.append(
+            {
+                "api": api,
+                "requests": sum(1 for s in mine if not is_warmup(s)),
+                "plans": plans,
+                "window": window,
+                "utilization_first": levels[0] if levels else None,
+                "utilization_last": levels[-1] if levels else None,
+                "reset": bool(levels) and levels[-1] < levels[0],
+            }
+        )
+    return out
+
+
+def _reported_at(sample: dict[str, Any]) -> float:
+    """When a sample's plan reading arrived: its start plus its duration."""
+    try:
+        start = datetime.fromisoformat(sample.get("wall_clock") or "").timestamp()
+    except ValueError:
+        start = 0.0
+    return start + (sample.get("e2e_s") or 0.0)
 
 
 def fmt(value: float | None, digits: int = 1, scale: float = 1.0) -> str:

@@ -400,6 +400,8 @@ import json, os, sys, time
 args = sys.argv[1:]
 if args[:1] == ["--version"]:
     print("9.9.9 (Claude Code)"); sys.exit(0)
+if args[:2] == ["auth", "status"] and os.environ.get("TPS_FAKE_AUTH") == "out":
+    print(json.dumps({"loggedIn": False})); sys.exit(0)
 if args[:2] == ["auth", "status"] and os.environ.get("TPS_FAKE_AUTH") == "broken":
     print("unknown option --json", file=sys.stderr); sys.exit(2)
 if args[:2] == ["auth", "status"]:
@@ -2608,7 +2610,7 @@ async def main() -> int:
             )
             check(
                 "mixed run: spend line names plan usage",
-                "4 requests on your plan" in screen and "on API" in screen,
+                "4 requests on your Claude plan" in screen and "on API" in screen,
                 screen,
             )
             check(
@@ -2848,9 +2850,9 @@ async def main() -> int:
         )
         check(
             "plan usage: one window only, measured requests only",
-            usage["window"] == "seven_day"
-            and (usage["utilization_first"], usage["utilization_last"]) == (0.40, 0.41)
-            and usage["requests"] == 3,
+            usage[0]["window"] == "seven_day"
+            and (usage[0]["utilization_first"], usage[0]["utilization_last"]) == (0.40, 0.41)
+            and usage[0]["requests"] == 3,
             str(usage),
         )
 
@@ -3024,7 +3026,7 @@ async def main() -> int:
             )
             check(
                 "codex: `tps codex` defaults to the plan's default model",
-                backend.defaults(str(fake_codex)) == ("cx-fast",),
+                backend.defaults(str(fake_codex)) == (("cx-fast",), ""),
                 str(backend.defaults(str(fake_codex))),
             )
             (work / "cx.toml").write_text(
@@ -3068,6 +3070,117 @@ async def main() -> int:
                 and "plus" in row.get("detail", "")
                 and "someone@example.com" not in proc.stdout,
                 str(row),
+            )
+            # review fixes, each pinned
+            proc = tps(["run", "-c", "cx.toml", "-o", "cx-run2"], work, env_extra=cli_env)
+            text = codex_log.read_text()
+            runs = [chunk for chunk in text.split('{"argv"') if '"turn/start"' in chunk]
+            check(
+                "codex: default effort resolved before the run, never inside a timed request",
+                runs and all('"model/list"' not in chunk for chunk in runs[-2:]),
+                str([chunk.count("model/list") for chunk in runs[-2:]]),
+            )
+            session = clis.CodexSession(backend, "hi", "m", "low")
+            same = {"tokenUsage": {"last": {"inputTokens": 1, "outputTokens": 2}}}
+            counts = [
+                session.parse({"method": "thread/tokenUsage/updated", "params": same}).api_call
+                for _ in range(2)
+            ]
+            check(
+                "codex: a repeated usage update is not a second model call", counts == [True, False]
+            )
+            empty = work / "empty-path"
+            empty.mkdir(exist_ok=True)
+            no_codex = {"PATH": str(empty)}
+            proc = tps(["codex", "--dry-run", "--json"], work, env_extra=no_codex)
+            plan = json.loads(proc.stdout or "{}").get("plan", {})
+            check(
+                "codex --dry-run: asks the plan nothing (works without codex installed)",
+                proc.returncode == 0 and len(plan.get("targets", [])) == 1,
+                proc.stdout[-300:] + proc.stderr[-300:],
+            )
+            proc = tps(["codex", "-y", "--json"], work, env_extra=no_codex)
+            check(
+                "codex: an unreadable default model is an error, never a guess",
+                proc.returncode == 1 and "default model" in proc.stdout,
+                proc.stdout[-300:],
+            )
+            proc = tps(["codex", "m", "-e", "all", "--mock", "--json"], work)
+            check(
+                "codex: -e all (incl. ultra) renders without crashing",
+                proc.returncode == 0
+                and len(json.loads(proc.stdout or "{}").get("results", [])) == 6,
+                proc.stdout[-300:] + proc.stderr[-300:],
+            )
+            proc = tps(
+                ["run", "-c", "cc.toml", "--json"],
+                work,
+                env_extra={**cli_env, "TPS_FAKE_AUTH": "out"},
+            )
+            check(
+                "cli: signed out → exit 2 (missing credentials) before anything is sent",
+                proc.returncode == 2 and "not signed in" in proc.stdout,
+                proc.stdout[-300:],
+            )
+            (work / "cc-baseurl.toml").write_text(
+                cc_toml + 'base_url = "https://proxy.internal/v1"\n', encoding="utf-8"
+            )
+            proc = tps(["run", "-c", "cc-baseurl.toml", "--dry-run", "--json"], work)
+            check(
+                "cli config: base_url on a CLI target → exit 1", proc.returncode == 1, proc.stdout
+            )
+            check(
+                "claude: one stop-reason map for HTTP and CLI",
+                core.ANTHROPIC_STOP is clis.ANTHROPIC_STOP
+                and clis.ANTHROPIC_STOP["tool_use"] == "tool_calls",
+            )
+            usage = core.plan_usage(
+                [
+                    {
+                        "target": "a",
+                        "batch": 0,
+                        "wall_clock": "2026-11-02T10:00:00+00:00",
+                        "e2e_s": 1,
+                        "plan_window": "five_hour",
+                        "plan_utilization": 0.92,
+                    },
+                    {
+                        "target": "a",
+                        "batch": 1,
+                        "wall_clock": "2026-11-02T10:01:00+00:00",
+                        "e2e_s": 1,
+                        "plan_window": "five_hour",
+                        "plan_utilization": 0.03,
+                    },
+                    {
+                        "target": "b",
+                        "batch": 0,
+                        "wall_clock": "2026-11-02T10:00:30+00:00",
+                        "e2e_s": 1,
+                        "plan_window": "five_hour",
+                        "plan_utilization": 0.60,
+                    },
+                ],
+                {
+                    "targets": [
+                        {"name": "a", "access": "cli", "api": "claude-code"},
+                        {"name": "b", "access": "cli", "api": "codex"},
+                    ]
+                },
+            )
+            claude_u = next(u for u in usage if u["api"] == "claude-code")
+            codex_u = next(u for u in usage if u["api"] == "codex")
+            check(
+                "plan usage: one entry per plan, never pooled across clients",
+                len(usage) == 2
+                and codex_u["utilization_first"] == codex_u["utilization_last"] == 0.60,
+                str(usage),
+            )
+            check(
+                "plan usage: first → last in reporting order; a rollover is marked",
+                (claude_u["utilization_first"], claude_u["utilization_last"]) == (0.92, 0.03)
+                and claude_u["reset"],
+                str(claude_u),
             )
             proc = tps(["codex", "--help"], work)
             check(

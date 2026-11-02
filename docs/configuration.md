@@ -113,9 +113,11 @@ installed and signed in, and to which plan.
 - **Unpriced.** Plan usage has no per-token price; rows land in
   `cost_unpriced`. `fingerprint` doesn't accept CLI targets (no logprobs or
   sampling control).
-- `api_key`, `api_key_env`, `headers`, `extra_body` and `max_tokens_field` don't
-  apply and are rejected (exit 1). `base_url` is ignored, and no `temperature` is
-  sent (`meta.json` records `temperature: null`).
+- `base_url`, `api_key`, `api_key_env`, `headers`, `extra_body` and
+  `max_tokens_field` don't apply and are rejected (exit 1): the CLI decides where
+  requests go. No `temperature` is sent (`meta.json` records `temperature: null`).
+- Before a real run tps checks each CLI's sign-in: signed out exits 2 (missing
+  credentials) before any plan usage is spent.
 
 `[run] temperature` takes a number or `"omit"`. Unset, OpenAI-compatible targets
 get `0` and Claude API targets get nothing; `meta.json` records what each target
