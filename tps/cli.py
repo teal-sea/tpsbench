@@ -19,6 +19,7 @@ import io
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 from datetime import UTC, datetime
@@ -363,6 +364,7 @@ def summarise(samples: list[dict[str, Any]], meta: dict[str, Any]) -> dict[str, 
                 "ttft_p50_s": _r(st["ttft_p50_s"]),
                 "ttft_p90_s": _r(st["ttft_p90_s"]),
                 "startup_p50_s": _r(st["startup_p50_s"]),
+                "api_calls_median": st["api_calls_median"],
                 "first_content_p50_s": _r(st["first_content_p50_s"]),
                 "out_tps_p50": _r(st["out_tps_p50"], 2),
                 "out_tps_p90": _r(st["out_tps_p90"], 2),
@@ -752,7 +754,9 @@ def _run_box(
             title += " · " + " · ".join(shared)
         startup = core.median([r.get("startup_p50_s") for r in rows])
         legend = "p50 · ttft incl. " + (f"~{startup:.1f}s " if startup else "")
-        legend += "CLI startup — compare within this box · tok/s decode rate"
+        legend += "CLI startup — compare within this box"
+        if not all(clis.backend(r["api"]).caps_output for r in rows):
+            legend += " · no output cap"
     else:
         title += " · API" if mixed else ""
         if _row_labels(rows)[0] not in ("provider", "target"):
@@ -1540,7 +1544,8 @@ def cmd_plan(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
     exit codes match `run`.
     """
     backend = clis.backend(args.backend_api)
-    models = [m for arg in (args.models or backend.default_models) for m in arg.split(",") if m]
+    named = args.models or backend.defaults(shutil.which(backend.binary))
+    models = [m for arg in named for m in arg.split(",") if m]
     efforts = None
     if args.effort:
         efforts = ",".join(backend.efforts) if args.effort.strip() == "all" else args.effort

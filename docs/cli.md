@@ -163,6 +163,20 @@ never asks. Output, JSON and exit codes are `run`'s. `opus`/`sonnet`/`haiku` are
 Claude Code's aliases for the latest of each; `served_models` and the box title
 name the exact model that answered. `tps claude --help` lists everything.
 
+## `tps codex`
+
+The models in your ChatGPT plan, the same way as `tps claude`:
+
+```bash
+tps codex                                  # the plan's default model, its default effort
+tps codex gpt-6.1-sol gpt-6-astra -e low,high
+tps codex gpt-6.1-sol -e all
+```
+
+Model names are the ids `codex` lists for your plan. Codex has no output cap
+(`--max-tokens` doesn't apply), and its text arrives in bursts — see
+[configuration](configuration.md#chatgpt-plan-api-codex).
+
 ## `tps report`
 
 ```bash

@@ -78,6 +78,13 @@ startup (the box says how much); tok/s is the model's. The long form, for
 configs and scripts: `tps run --api claude-code --model …` — see
 [configuration](configuration.md#claude-subscription-api-claude-code).
 
+**ChatGPT, on your subscription** — through the signed-in `codex` client:
+
+```bash
+tps codex                                  # your plan's default model
+tps codex gpt-6.1-sol gpt-6-astra -e low,high
+```
+
 **Every provider of a model, via OpenRouter:**
 
 ```bash

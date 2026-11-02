@@ -670,6 +670,9 @@ class Sample:
     plan_window: str | None = None
     # the model id the API says served the request ("opus" → "claude-opus-5-5")
     served_model: str | None = None
+    # CLI targets: model calls the client made for this request (Codex can make
+    # a hidden one before the call that streams the answer)
+    api_calls: int | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
@@ -1061,6 +1064,7 @@ async def cli_once(
     the cap is a real per-request cap and no extra plan usage is spent.
     """
     backend = target.backend
+    session = backend.session(prompt_text, target.model, target.effort)
     sample = Sample(
         target=target.name,
         prompt=prompt_name,
@@ -1101,7 +1105,13 @@ async def cli_once(
             obj = json.loads(raw)
         except ValueError:
             return None
-        return backend.parse(obj) if isinstance(obj, dict) else None
+        return session.parse(obj) if isinstance(obj, dict) else None
+
+    async def write(lines: list[str] | list[dict[str, Any]]) -> None:
+        for line in lines:
+            text = line if isinstance(line, str) else json.dumps(line) + "\n"
+            stdin.write(text.encode("utf-8"))
+        await stdin.drain()
 
     def note_plan(event: clis.CliEvent) -> None:
         nonlocal plan_rejected
@@ -1111,16 +1121,24 @@ async def cli_once(
 
     async def consume() -> None:
         nonlocal first, last, chars, reasoning_chars, first_chars, failure, stopped
-        stdin.write(prompt_text.encode("utf-8"))
-        await stdin.drain()
-        stdin.close()
+        await write(session.opening())
+        if session.close_stdin:
+            stdin.close()
         async for raw in stdout:
             event = read(raw)
             if event is None:
                 continue
             note_plan(event)
+            if event.send and not stdin.is_closing():
+                await write(event.send)
+            if event.model:
+                sample.served_model = event.model
+            if event.api_call:
+                sample.api_calls = (sample.api_calls or 0) + 1
             if event.error:
                 failure = event
+                if event.final:
+                    return  # the client reported a failure: nothing more to time
             if not event.stream:
                 continue
             if stopped:
@@ -1128,15 +1146,15 @@ async def cli_once(
             now = time.perf_counter()
             if sample.startup_s is None:
                 sample.startup_s = now - t0
-            if event.model:
-                sample.served_model = event.model
             usage.update(event.usage)
             if event.finish:
                 sample.finish_reason = event.finish
             if event.stop:
-                # first response complete: the measurement ends here
+                # the response is complete: the measurement ends here
                 stopped = True
                 sample.e2e_s = now - t0
+                if event.final:
+                    return  # the client won't exit on its own: stop it now
                 if sample.finish_reason == "length" and backend.continues_after_cap:
                     # a continuation request follows: take a plan reading if it
                     # is the very next line, then stop the client
@@ -1175,8 +1193,10 @@ async def cli_once(
             sample.error = f"cli_io: {type(exc).__name__}: {exc}"[:300]
         if sample.e2e_s is None or sample.error:
             sample.e2e_s = time.perf_counter() - t0
-        if stopped or sample.error:
-            await _stop(proc)  # before any continuation request goes out
+        if stopped or sample.error or failure is not None or not session.close_stdin:
+            # before any continuation request goes out — and a client that
+            # reported a failure, or that never exits on its own, is stopped too
+            await _stop(proc)
         code = await proc.wait()
         stderr = (await stderr_task).decode("utf-8", "replace").strip()
     finally:
@@ -1330,6 +1350,7 @@ def rotate(items: list[Any], n: int) -> list[Any]:
 # Warm-ups only open connections and warm the provider's prompt cache, and are
 # discarded; generating a full-length answer for them would just cost money.
 WARMUP_MAX_TOKENS = 16
+WARMUP_UNCAPPED_PROMPT = "Reply with one word: ready"
 
 
 def planned_requests(cfg: RunConfig) -> int:
@@ -1508,12 +1529,15 @@ async def execute(
             warm_name, warm_spec = next(iter(cfg.prompts.items()))
             warm_text = build_prompt(warm_spec)
             for target in cfg.targets:
+                # a client that can't cap output would write a whole answer just
+                # to warm up: give it a one-word prompt instead
+                uncapped = target.is_cli and not target.backend.caps_output
                 for _ in range(cfg.warmup):
                     record(
                         await run_target_batch(
                             client,
                             target,
-                            warm_text,
+                            WARMUP_UNCAPPED_PROMPT if uncapped else warm_text,
                             warm_name,
                             min(int(warm_spec.get("max_tokens", 256)), WARMUP_MAX_TOKENS),
                             cfg,
@@ -1613,6 +1637,7 @@ def _bucket() -> dict[str, Any]:
         "in": [],
         "out": [],
         "startup": [],
+        "calls": [],
         "batches": [],
         "ok": 0,
         "n": 0,
@@ -1636,6 +1661,7 @@ _FIELDS = (
     ("in", "in_tokens"),
     ("out", "out_tokens"),
     ("startup", "startup_s"),
+    ("calls", "api_calls"),
 )
 
 # A request whose median chunk gap is under this share of its typical gap got
@@ -1747,6 +1773,8 @@ def bucket_stats(bucket: dict[str, Any]) -> dict[str, Any]:
         "in_tokens_median": median(bucket["in"]),
         # CLI targets only: client startup inside TTFT (None for HTTP targets)
         "startup_p50_s": p50(bucket["startup"]),
+        # CLI targets: model calls per request (>1: the client made hidden ones)
+        "api_calls_median": median(bucket["calls"]),
         "aggregate_tps": median(bucket["batches"]),
         "ok": bucket["ok"],
         "n": bucket["n"],
@@ -1799,6 +1827,12 @@ def row_notes(st: dict[str, Any]) -> list[str]:
         notes.append(
             f"CLI target: TTFT includes ~{startup:.1f}s of client startup (median, process "
             "start → first stream event) — don't rank it against HTTP TTFT; tok/s is unaffected"
+        )
+    calls = st.get("api_calls_median")
+    if calls and calls > 1:
+        notes.append(
+            f"the client made {calls:g} model calls per request (median) before the answer "
+            "finished — TTFT includes the earlier ones; tok/s is the answering call's"
         )
     if st["bursty"]:
         tpc = st["tokens_per_chunk_median"]

@@ -464,6 +464,68 @@ out({"type": "result", "subtype": "success", "is_error": False,
 """
 
 
+# A stand-in for `codex app-server`: the JSON-RPC subset tps speaks, replayed
+# from recordings. It never exits on its own, like the real one.
+FAKE_CODEX = r"""
+import json, os, sys, time
+args = sys.argv[1:]
+if args[:1] == ["--version"]:
+    print("codex-cli 9.9.9"); sys.exit(0)
+log = open(os.environ["TPS_FAKE_LOG"] + ".codex", "a")
+log.write(json.dumps({"argv": args, "env": {k: os.environ.get(k) for k in
+                      ("OPENAI_API_KEY", "CODEX_API_KEY")}}) + "\n")
+def out(o): print(json.dumps(o), flush=True)
+def note(method, **params): out({"method": method, "params": params})
+model = None
+for line in sys.stdin:
+    msg = json.loads(line)
+    rid, method, params = msg.get("id"), msg.get("method"), msg.get("params") or {}
+    log.write(json.dumps({"got": method, "params": params}) + "\n"); log.flush()
+    if method == "initialize":
+        out({"id": rid, "result": {"userAgent": "x"}})
+    elif method == "account/read":
+        out({"id": rid, "result": {"account": {"type": "chatgpt", "planType": "plus",
+                                               "email": "someone@example.com"}}})
+    elif method == "model/list":
+        out({"id": rid, "result": {"data": [
+            {"id": "cx-fast", "isDefault": True, "defaultReasoningEffort": "low"},
+            {"id": "cx-hidden", "defaultReasoningEffort": "medium"}]}})
+    elif method == "thread/start":
+        model = params.get("model")
+        out({"id": rid, "result": {"thread": {"id": "th1"}, "model": model + "-served"}})
+    elif method == "turn/start":
+        out({"id": rid, "result": {"turn": {"id": "t1", "status": "inProgress"}}})
+        time.sleep(0.05)  # client startup
+        note("turn/started", threadId="th1", turn={"id": "t1"})
+        if model == "cx-limit":
+            note("error", threadId="th1", turnId="t1", willRetry=True,
+                 error={"message": "You've hit your usage limit", "codexErrorInfo": "usageLimitExceeded"})
+            continue
+        if model == "cx-tool":
+            note("item/started", item={"type": "commandExecution", "id": "c1"})
+            continue
+        def usage(out_tokens, hidden):
+            note("thread/tokenUsage/updated", threadId="th1", turnId="t1", tokenUsage={
+                "total": {}, "last": {"inputTokens": 5000, "cachedInputTokens": 3000,
+                                      "outputTokens": out_tokens, "reasoningOutputTokens": hidden,
+                                      "totalTokens": 0}})
+        if model == "cx-hidden":
+            time.sleep(0.3)
+            usage(400, 50)  # a model call with nothing visible
+        time.sleep(0.05)  # reasoning, announced once done
+        note("item/started", item={"type": "reasoning", "id": "r1"})
+        note("item/started", item={"type": "agentMessage", "id": "m1"})
+        for _ in range(10):
+            note("item/agentMessage/delta", delta="word", itemId="m1", threadId="th1", turnId="t1")
+            time.sleep(0.01)
+        usage(12, 2)
+        note("account/rateLimits/updated", rateLimits={"primary": {"usedPercent": 40,
+             "windowDurationMins": 10080}, "planType": "plus"})
+        note("turn/completed", threadId="th1", turn={"id": "t1", "status": "completed"})
+        # like the real app-server: stays up until it is stopped
+"""
+
+
 def target_block(name: str, base: str, model: str, extra: str = "") -> str:
     return f'[[targets]]\nname = "{name}"\nbase_url = "{base}"\nmodel = "{model}"\n{extra}\n'
 
@@ -2852,6 +2914,171 @@ async def main() -> int:
         )
         proc = tps(["claude", "opus", "--mock", "-o", "cl"], work, env_extra={"COLUMNS": "100"})
         check("claude: header names the command", "tps claude" in proc.stdout, proc.stdout[:300])
+
+        print("codex backend (fake app-server):")
+        fake_codex = work / "fake-codex"
+        fake_codex.write_text(f"#!{sys.executable}\n{FAKE_CODEX}", encoding="utf-8")
+        fake_codex.chmod(0o755)
+        codex_log = Path(str(fake_log) + ".codex")
+        os.environ.update(cli_env, OPENAI_API_KEY="sk-should-be-stripped")
+        try:
+
+            def cx(model: str, **kw) -> core.Target:
+                return core.Target(
+                    name=model, base_url="", model=model, api="codex", cli=str(fake_codex), **kw
+                )
+
+            started = time.perf_counter()
+            fast = await core.cli_once(cx("cx-fast"), "hi", "p", 512, cli_cfg, 1, 0)
+            took = time.perf_counter() - started
+            check("codex: ok", fast.ok, str(fast.error))
+            check(
+                "codex: tokens from the answering call's usage",
+                fast.out_tokens == 12
+                and fast.hidden_reasoning_tokens == 2
+                and fast.in_tokens == 5000,
+                f"{fast.out_tokens} {fast.hidden_reasoning_tokens} {fast.in_tokens}",
+            )
+            check("codex: tok/s measured from deltas", fast.out_tps is not None, str(fast.out_tps))
+            check(
+                "codex: startup is client startup (turn started), not model thinking",
+                fast.startup_s is not None and fast.startup_s < fast.ttft_s,
+                f"{fast.startup_s} {fast.ttft_s}",
+            )
+            check(
+                "codex: a server that never exits is stopped at turn/completed",
+                took < 5,
+                f"{took:.1f}s",
+            )
+            check(
+                "codex: plan window read (7-day, 40%)",
+                fast.plan_window == "seven_day" and fast.plan_utilization == 0.4,
+                f"{fast.plan_window} {fast.plan_utilization}",
+            )
+            check("codex: served model recorded", fast.served_model == "cx-fast-served")
+            sent = [json.loads(line) for line in codex_log.read_text().splitlines()]
+            turn = next(e for e in reversed(sent) if e.get("got") == "turn/start")["params"]
+            thread = next(e for e in reversed(sent) if e.get("got") == "thread/start")["params"]
+            boot = next(e for e in reversed(sent) if "argv" in e)
+            init = next(e for e in reversed(sent) if e.get("got") == "initialize")["params"]
+            check(
+                "codex: default effort is the model's own (from model/list), not the user's",
+                turn.get("effort") == "low",
+                str(turn.get("effort")),
+            )
+            check(
+                "codex: standard service tier, stripped instructions, read-only, ephemeral",
+                thread.get("serviceTier") == "default"
+                and thread.get("sandbox") == "read-only"
+                and thread.get("ephemeral") is True
+                and "cwd" not in thread
+                and len(thread.get("baseInstructions") or "") < 80,
+                str(thread),
+            )
+            check(
+                "codex: identifies as tps, never as another client",
+                init["clientInfo"]["name"] == "tps",
+                str(init),
+            )
+            check(
+                "codex: hooks, apps, plugins and MCP off; API key stripped",
+                all(f in boot["argv"] for f in ("hooks", "apps", "plugins", "mcp_servers={}"))
+                and boot["env"]["OPENAI_API_KEY"] is None,
+                str(boot),
+            )
+            high = await core.cli_once(cx("cx-fast", effort="high"), "hi", "p", 512, cli_cfg, 1, 0)
+            sent = [json.loads(line) for line in codex_log.read_text().splitlines()]
+            turn = next(e for e in reversed(sent) if e.get("got") == "turn/start")["params"]
+            check(
+                "codex: an explicit effort is sent as is",
+                high.ok and turn.get("effort") == "high",
+                str(turn),
+            )
+            hidden = await core.cli_once(cx("cx-hidden"), "hi", "p", 512, cli_cfg, 1, 0)
+            check(
+                "codex: hidden earlier call counted; usage is the answering call's",
+                hidden.ok and hidden.api_calls == 2 and hidden.out_tokens == 12,
+                f"{hidden.api_calls} {hidden.out_tokens}",
+            )
+            started = time.perf_counter()
+            limit = await core.cli_once(cx("cx-limit"), "hi", "p", 512, cli_cfg, 1, 0)
+            check(
+                "codex: usage limit → rate_limited at once, no waiting on its retries",
+                (limit.error or "").startswith("rate_limited")
+                and limit.status == 429
+                and time.perf_counter() - started < 5,
+                str(limit.error),
+            )
+            tool = await core.cli_once(cx("cx-tool"), "hi", "p", 512, cli_cfg, 1, 0)
+            check(
+                "codex: a tool call is an error, not a timed answer",
+                not tool.ok and "tool" in (tool.error or ""),
+                str(tool.error),
+            )
+            backend = clis.backend("codex")
+            auth = backend.auth(str(fake_codex))
+            check(
+                "codex: sign-in and plan from account/read",
+                auth.signed_in and auth.plan == "Plus" and auth.subscription,
+                str(auth),
+            )
+            check(
+                "codex: `tps codex` defaults to the plan's default model",
+                backend.defaults(str(fake_codex)) == ("cx-fast",),
+                str(backend.defaults(str(fake_codex))),
+            )
+            (work / "cx.toml").write_text(
+                '[run]\nreps = 1\nwarmup = 1\nprompts = ["prose-256"]\n\n'
+                f'[[targets]]\nname = "cx"\napi = "codex"\nmodel = "cx-fast"\ncli = "{fake_codex}"\n',
+                encoding="utf-8",
+            )
+            proc = tps(
+                ["run", "-c", "cx.toml", "-o", "cx-run"],
+                work,
+                env_extra={**cli_env, "COLUMNS": "120"},
+            )
+            check(
+                "codex run: plan box says ChatGPT and 'no output cap'",
+                proc.returncode == 0
+                and "ChatGPT Plus plan" in proc.stdout
+                and "no output cap" in proc.stdout,
+                proc.stdout[-600:] + proc.stderr[-300:],
+            )
+            sent = [json.loads(line) for line in codex_log.read_text().splitlines()]
+            prompts = [
+                e["params"]["input"][0]["text"] for e in sent if e.get("got") == "turn/start"
+            ]
+            check(
+                "codex run: the warm-up asks for one word (no cap to keep it short)",
+                core.WARMUP_UNCAPPED_PROMPT in prompts[-2:],
+                str(prompts[-2:]),
+            )
+            proc = tps(["doctor", "-c", "cx.toml", "--json"], work, env_extra=cli_env)
+            row = next(
+                (
+                    c
+                    for c in json.loads(proc.stdout or "{}").get("checks", [])
+                    if c["check"].startswith("cli ")
+                ),
+                {},
+            )
+            check(
+                "codex doctor: signed in, plan shown, email never printed",
+                row.get("ok")
+                and "plus" in row.get("detail", "")
+                and "someone@example.com" not in proc.stdout,
+                str(row),
+            )
+            proc = tps(["codex", "--help"], work)
+            check(
+                "codex: `tps codex --help` with examples",
+                "tps codex -e" in proc.stdout or "tps codex gpt" in proc.stdout,
+                proc.stdout[-300:],
+            )
+        finally:
+            os.environ.pop("OPENAI_API_KEY", None)
+            for key in cli_env:
+                os.environ.pop(key, None)
 
         print("report provenance:")
         (work / "unknown_rate.toml").write_text(

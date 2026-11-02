@@ -121,6 +121,46 @@ installed and signed in, and to which plan.
 get `0` and Claude API targets get nothing; `meta.json` records what each target
 was actually sent.
 
+## ChatGPT plan (`api = "codex"`)
+
+```toml
+[[targets]]
+name = "chatgpt-sol-low"
+api = "codex"
+model = "gpt-6.1-sol"
+effort = "low"            # low … ultra; omit = the model's own default
+```
+
+Or with no file: `tps codex` (your plan's default model) or `tps codex
+gpt-6.1-sol gpt-6-astra -e low,high`.
+
+tps runs the signed-in `codex` client's **app-server** — the protocol Codex's
+own IDE integrations use, and the only Codex interface that streams text as it
+is generated (`codex exec --json` only reports finished messages, which can't
+be timed per token). OpenAI documents ChatGPT sign-in for `codex exec`
+automation; tps identifies itself as `tps`, never as another client, and never
+reads or copies `~/.codex/auth.json`.
+
+- **Your setup is switched off for tps only:** hooks (they would run your
+  scripts on every request), apps, plugins, skills, MCP servers, AGENTS.md,
+  web search and tools. `~/.codex/config.toml` is not modified. The prompt
+  still carries ~5k tokens of Codex's own context; the row's input size says so.
+- **Your preferences don't leak in:** the model's own default effort (from
+  `model/list`) is sent unless you set `effort`, and the **standard** service
+  tier is requested even if your config prefers priority.
+- **No output cap.** Codex can't cap a response, so `--max-tokens` doesn't apply
+  and answers run to their natural length (the box says "no output cap").
+  Warm-ups use a one-word prompt for the same reason.
+- **Hidden model calls are counted.** Codex sometimes makes a model call that
+  shows nothing before the one that streams the answer. `api_calls_median` and
+  a note report it; tok/s is the answering call's rate, and TTFT — to the first
+  answer text — includes the hidden call.
+- **No retries:** Codex can't be told not to retry, so tps records its first
+  error (`willRetry` or not) and stops it. Usage and rate limits are
+  `rate_limited`.
+- **Bursty delivery.** The app-server flushes text in clumps; rows are flagged
+  `bursty` and the ITL column measures the flushing, not the model.
+
 ## Grids: models × effort (`[[grids]]`)
 
 One block measures every combination. Each becomes an ordinary target — named

@@ -55,6 +55,9 @@ and keeps hidden thinking out of tok/s. A Claude **subscription** is measured wi
 Subscription CLIs are adapters in `tps/clis.py` (`CliBackend`; see
 CONTRIBUTING.md → Adding a subscription CLI); the loop in `core.cli_once` is
 shared — never add vendor branches to it.
+`tps codex [MODEL …] [-e …]` does the same for ChatGPT plans via `codex
+app-server` (no output cap; hidden extra model calls reported as
+`api_calls_median`).
 `tps claude [opus sonnet haiku] [-e low,high]` is the short form: it runs
 exactly `run --api claude-code` (same JSON, `command: "run"`), defaults to
 opus/sonnet/haiku, 5 reps, `--max-tokens 2048`, and asks before running only on

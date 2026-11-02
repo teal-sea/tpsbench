@@ -1,6 +1,6 @@
 # Design: access modes, model × effort grids, and a guided TUI
 
-Status: **in progress** (2026-11-02). Step 1 (`api = "claude-code"`) is in PR #6; step 2 (effort, grids, `tps claude`, CLI backend adapters) in PR #7.
+Status: **in progress** (2026-11-02). Step 1 (`claude-code`) is in PR #6; step 2 (effort, grids, `tps claude`, CLI adapters) and the first step-3 backend (`codex`) in PR #7.
 
 ## Problem
 

@@ -46,6 +46,27 @@ class CliEvent:
     plan_rejected: bool = False  # the plan's limit refused the request
     error: str | None = None  # a final error the client reported
     status: int | None = None  # HTTP status behind that error, when known
+    api_call: bool = False  # one model call finished (counted per request)
+    final: bool = False  # nothing more worth reading: stop the client now
+    send: list[dict[str, Any]] = field(default_factory=list)  # replies to write (JSON lines)
+
+
+class CliSession:
+    """One request's conversation with a client. The default writes the prompt
+    to stdin, closes it and reads; clients that speak a protocol (Codex's
+    app-server) keep stdin open and answer what they read through `send`."""
+
+    close_stdin = True
+
+    def __init__(self, backend: CliBackend, prompt: str, model: str, effort: str | None) -> None:
+        self.backend, self.prompt, self.model, self.effort = backend, prompt, model, effort
+
+    def opening(self) -> list[str]:
+        """What to write first: raw text (the prompt) or JSON lines."""
+        return [self.prompt]
+
+    def parse(self, obj: dict[str, Any]) -> CliEvent | None:
+        return self.backend.parse(obj)
 
 
 @dataclass
@@ -77,6 +98,15 @@ class CliBackend:
     # the client sends continuation requests after a capped response, so the
     # loop must stop it right after the first response
     continues_after_cap: bool = False
+    # whether --max-tokens can be enforced; False: answers run their natural length
+    caps_output: bool = True
+
+    def session(self, prompt: str, model: str, effort: str | None) -> CliSession:
+        return CliSession(self, prompt, model, effort)
+
+    def defaults(self, path: str | None) -> tuple[str, ...]:
+        """The models `tps <command>` measures when none are named."""
+        return self.default_models
 
     def argv(self, path: str, model: str, effort: str | None) -> list[str]:
         raise NotImplementedError
@@ -142,6 +172,7 @@ class ClaudeCode(CliBackend):
     )
     # a capped response is followed by silent continuation requests
     continues_after_cap = True
+    caps_output = True
 
     def argv(self, path: str, model: str, effort: str | None) -> list[str]:
         cmd = [
@@ -211,7 +242,7 @@ class ClaudeCode(CliBackend):
             stop = (event.get("delta") or {}).get("stop_reason")
             out.finish = ANTHROPIC_STOP.get(stop, stop)
         elif etype == "message_stop":
-            out.stop = True
+            out.stop = out.api_call = True
         elif etype == "content_block_delta":
             delta = event.get("delta") or {}
             if delta.get("type") == "text_delta":
@@ -249,10 +280,289 @@ def _claude_usage(usage: dict[str, Any]) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
+# Codex (ChatGPT plans)
+# --------------------------------------------------------------------------
+
+# `codex exec --json` reports only whole messages, so it can't be timed per
+# token; `codex app-server` (the protocol Codex's IDE integrations use) streams
+# deltas. tps speaks it as itself (clientInfo "tps"), on the user's sign-in.
+# Everything the user's setup adds is switched off for tps's process only:
+CODEX_OFF = (
+    "hooks",  # the user's own scripts would run on every request
+    "apps",
+    "plugins",
+    "plugin_discovery_prefetch",
+    "remote_plugin",
+    "skill_search",
+    "skill_mcp_dependency_install",
+    "shell_tool",
+    "shell_snapshot",
+    "image_generation",
+    "in_app_browser",
+    "browser_use",
+    "browser_use_external",
+    "computer_use",
+    "multi_agent",
+    "goals",
+    "tool_suggest",
+    "view_image",
+    "sleep_tool",
+)
+# API keys a child `codex` would use instead of the signed-in plan
+CODEX_STRIP_ENV = ("OPENAI_API_KEY", "CODEX_API_KEY")
+CODEX_WINDOWS = {300: "five_hour", 10080: "seven_day"}
+CODEX_LIMITED = {"usageLimitExceeded", "rateLimitExceeded"}
+
+
+class Codex(CliBackend):
+    api = "codex"
+    command = "codex"
+    binary = "codex"
+    vendor = "ChatGPT"
+    efforts = ("low", "medium", "high", "xhigh", "max", "ultra")
+    default_models = ()  # the plan's own default, from `model/list`
+    model_help = "model ids from your plan (default: the plan's default model)"
+    example_model = "gpt-6.1-sol"
+    examples = (
+        ("", "your plan's default model at its default effort"),
+        ("gpt-6.1-sol gpt-6-astra -e low,high", "two models × two effort levels"),
+        ("gpt-6.1-sol -e all", "one model, every effort level"),
+        ("--dry-run", "what it would send, and how long it takes"),
+    )
+    # no output cap exists in Codex: answers run to their natural length
+    caps_output = False
+
+    def argv(self, path: str, model: str, effort: str | None) -> list[str]:
+        cmd = [path, "app-server", "-c", "mcp_servers={}", "-c", "project_doc_max_bytes=0"]
+        cmd += ["-c", 'web_search="disabled"']
+        for feature in CODEX_OFF:
+            cmd += ["--disable", feature]
+        return cmd
+
+    def env(self, max_tokens: int) -> dict[str, str]:
+        return {k: v for k, v in os.environ.items() if k not in CODEX_STRIP_ENV}
+
+    def session(self, prompt: str, model: str, effort: str | None) -> CliSession:
+        return CodexSession(self, prompt, model, effort)
+
+    def parse(self, obj: dict[str, Any]) -> CliEvent | None:  # pragma: no cover - via session
+        return None
+
+    def defaults(self, path: str | None) -> tuple[str, ...]:
+        models, _why = codex_query(path or self.binary, ["model/list"])
+        listed = ((models or {}).get("model/list") or {}).get("data") or []
+        default = [m.get("id") for m in listed if m.get("isDefault") and m.get("id")]
+        return tuple(default[:1]) or (self.example_model,)
+
+    def auth(self, path: str) -> Auth:
+        got, why = codex_query(path, ["account/read"])
+        if got is None:
+            return Auth(signed_in=None, why=why)
+        account = (got.get("account/read") or {}).get("account")
+        if not account:
+            return Auth(signed_in=False)
+        chatgpt = account.get("type") == "chatgpt"
+        plan = account.get("planType") if chatgpt else None
+        return Auth(
+            signed_in=True,
+            plan=str(plan).capitalize() if plan and plan != "unknown" else None,
+            method=account.get("type"),
+            subscription=chatgpt,
+        )
+
+
+class CodexSession(CliSession):
+    """initialize → thread/start (+ model/list for the model's own default
+    effort) → turn/start, then time the turn's streamed answer.
+
+    Codex can make a model call that never shows (no item, no text) before the
+    one that streams the answer. Every call is counted (`api_call`); the usage
+    kept is the answering call's own (`tokenUsage.last`), so tok/s is that
+    call's rate, and TTFT — to the first answer text — includes the hidden one.
+    """
+
+    close_stdin = False
+
+    def __init__(self, backend: CliBackend, prompt: str, model: str, effort: str | None) -> None:
+        super().__init__(backend, prompt, model, effort)
+        self.thread: str | None = None
+        self.turn_effort = effort  # None until model/list names the model's default
+
+    def opening(self) -> list[dict[str, Any]]:  # type: ignore[override]
+        info = {"name": "tps", "version": _version()}
+        return [{"id": 1, "method": "initialize", "params": {"clientInfo": info}}]
+
+    def _turn(self) -> list[dict[str, Any]]:
+        if not self.thread or not self.turn_effort:
+            return []
+        params = {
+            "threadId": self.thread,
+            "input": [{"type": "text", "text": self.prompt}],
+            "effort": self.turn_effort,
+        }
+        return [{"id": 4, "method": "turn/start", "params": params}]
+
+    def parse(self, obj: dict[str, Any]) -> CliEvent | None:
+        rid, method, params = obj.get("id"), obj.get("method"), obj.get("params") or {}
+        if rid is not None and method is None:  # a response to one of our requests
+            if "error" in obj:
+                message = (obj.get("error") or {}).get("message") or "request failed"
+                return CliEvent(error=f"{_RID.get(rid, 'request')}: {message}", final=True)
+            result = obj.get("result") or {}
+            if rid == 1:
+                start = {
+                    "model": self.model,
+                    "baseInstructions": CLAUDE_SYSTEM_PROMPT,
+                    "ephemeral": True,
+                    "sandbox": "read-only",
+                    "approvalPolicy": "never",
+                    # the standard tier, whatever the user's own config prefers
+                    "serviceTier": "default",
+                    # no cwd: the client already runs in tps's empty workdir
+                }
+                send = [{"method": "initialized"}]
+                send.append({"id": 2, "method": "thread/start", "params": start})
+                if not self.effort:
+                    send.append({"id": 3, "method": "model/list", "params": {}})
+                return CliEvent(send=send)
+            if rid == 2:
+                self.thread = (result.get("thread") or {}).get("id")
+                return CliEvent(model=result.get("model"), send=self._turn())
+            if rid == 3:
+                listed = result.get("data") or []
+                mine = next((m for m in listed if self.model in (m.get("id"), m.get("model"))), {})
+                # the model's own default, not the user's configured effort
+                self.turn_effort = mine.get("defaultReasoningEffort") or "medium"
+                return CliEvent(send=self._turn())
+            return None
+        if method == "turn/started":
+            # the client has the request: what came before was client startup.
+            # (The reasoning item is only announced once reasoning is done, so it
+            # would put the model's thinking inside "startup".)
+            return CliEvent(stream=True)
+        if method == "item/started":
+            kind = (params.get("item") or {}).get("type")
+            if kind not in ("userMessage", "reasoning", "agentMessage", None):
+                return CliEvent(
+                    error=f"the model used a tool ({kind}); not a single answer", final=True
+                )
+            return None
+        if method == "item/agentMessage/delta":
+            return CliEvent(stream=True, piece=params.get("delta") or "")
+        if method in ("item/reasoning/textDelta", "item/reasoning/summaryTextDelta"):
+            return CliEvent(stream=True, reasoning=params.get("delta") or "")
+        if method == "thread/tokenUsage/updated":
+            last = (params.get("tokenUsage") or {}).get("last") or {}
+            usage = {
+                "input_tokens": last.get("inputTokens"),
+                "output_tokens": last.get("outputTokens"),
+                "output_tokens_details": {"thinking_tokens": last.get("reasoningOutputTokens")},
+            }
+            return CliEvent(stream=True, api_call=True, usage=usage)
+        if method == "account/rateLimits/updated":
+            limits = params.get("rateLimits") or {}
+            window = limits.get("primary") or {}
+            used = window.get("usedPercent")
+            minutes = window.get("windowDurationMins")
+            return CliEvent(
+                plan_window=CODEX_WINDOWS.get(minutes, f"{minutes}_min") if minutes else None,
+                plan_utilization=used / 100 if isinstance(used, int | float) else None,
+                plan_rejected=bool(limits.get("rateLimitReachedType")),
+            )
+        if method == "error":
+            err = params.get("error") or {}
+            info = err.get("codexErrorInfo")
+            code = info if isinstance(info, str) else next(iter(info or {}), None)
+            message = err.get("message") or "error"
+            if params.get("willRetry"):
+                message += " (the client would retry; tps records the first failure)"
+            return CliEvent(
+                error=message, status=429 if code in CODEX_LIMITED else None, final=True
+            )
+        if method == "turn/completed":
+            turn = params.get("turn") or {}
+            if turn.get("status") == "completed":
+                return CliEvent(stream=True, stop=True, finish="stop", final=True)
+            message = (turn.get("error") or {}).get("message") or f"turn {turn.get('status')}"
+            return CliEvent(error=message, final=True)
+        return None
+
+
+_RID = {1: "initialize", 2: "thread/start", 3: "model/list", 4: "turn/start"}
+
+
+def _version() -> str:
+    from . import __version__
+
+    return __version__
+
+
+def codex_query(path: str, methods: list[str]) -> tuple[dict[str, Any] | None, str]:
+    """Ask a short-lived `codex app-server` a few read-only questions
+    (account/read, model/list) → ({method: result}, "") or (None, why not)."""
+    argv = [path, "app-server"]
+    for feature in ("hooks", "apps", "plugins"):
+        argv += ["--disable", feature]
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            env={k: v for k, v in os.environ.items() if k not in CODEX_STRIP_ENV},
+        )
+    except OSError as exc:
+        return None, f"`codex app-server` failed: {exc.strerror or exc}"
+    assert proc.stdin and proc.stdout
+    ids = {10 + i: m for i, m in enumerate(methods)}
+    got: dict[str, Any] = {}
+
+    def send(obj: dict[str, Any]) -> None:
+        proc.stdin.write(json.dumps(obj) + "\n")
+        proc.stdin.flush()
+
+    import threading
+
+    timer = threading.Timer(20, proc.kill)
+    timer.start()
+    try:
+        send(
+            {
+                "id": 1,
+                "method": "initialize",
+                "params": {"clientInfo": {"name": "tps", "version": _version()}},
+            }
+        )
+        for line in proc.stdout:
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if obj.get("id") == 1:
+                send({"method": "initialized"})
+                for rid, method in ids.items():
+                    send({"id": rid, "method": method, "params": {}})
+            elif obj.get("id") in ids:
+                if "error" in obj:
+                    return None, f"`{ids[obj['id']]}` failed: {(obj['error'] or {}).get('message')}"
+                got[ids[obj["id"]]] = obj.get("result") or {}
+                if len(got) == len(ids):
+                    return got, ""
+        return None, "`codex app-server` exited without answering (timed out after 20s?)"
+    except (OSError, ValueError) as exc:
+        return None, f"`codex app-server`: {exc}"
+    finally:
+        timer.cancel()
+        proc.kill()
+        proc.wait()
+
+
+# --------------------------------------------------------------------------
 # registry
 # --------------------------------------------------------------------------
 
-BACKENDS: dict[str, CliBackend] = {b.api: b for b in (ClaudeCode(),)}
+BACKENDS: dict[str, CliBackend] = {b.api: b for b in (ClaudeCode(), Codex())}
 CLI_APIS = tuple(BACKENDS)
 
 

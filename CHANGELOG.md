@@ -39,6 +39,11 @@ First public release.
   / `--effort`): measured through the signed-in `claude` CLI, context stripped,
   client retries off, only the first API call timed; `startup_p50_s` and a note
   separate CLI startup from TTFT; `doctor` checks the CLI's sign-in and plan.
+- `tps codex` / `api = "codex"`: ChatGPT plans through the signed-in `codex`
+  app-server (streamed deltas), with the user's hooks, apps, plugins, MCP,
+  AGENTS.md and tools off, the model's own default effort, the standard tier,
+  plan and usage-window readings, hidden model calls counted, and its retries
+  cut off at the first error.
 - `tps claude [opus sonnet haiku] [-e low,high|all] [-n REPS]`: the models in
   your Claude plan in one short command, with plan defaults, a confirmation on
   a terminal, and the exact model each alias resolved to.
