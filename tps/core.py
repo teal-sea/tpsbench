@@ -460,6 +460,7 @@ def expand_grids(grids: list[dict[str, Any]], path: Path) -> list[dict[str, Any]
         models = [models] if isinstance(models, str) else list(models or [])
         efforts = grid.get("effort")
         efforts = [efforts] if efforts is None or isinstance(efforts, str) else list(efforts)
+        efforts = [e.lower() if isinstance(e, str) else e for e in efforts]
         if not models or not efforts or not all(isinstance(m, str) and m for m in models):
             raise UsageError(
                 f"{path}: grid {name!r}: `models` and `effort` need at least one value"
@@ -1212,17 +1213,27 @@ async def cli_once(
             reasoning_chars += len(reasoning)
 
     try:
-        await asyncio.wait_for(consume(), cfg.timeout_s)
-    except TimeoutError:
-        sample.error = "timeout"
-    except (OSError, ValueError) as exc:  # broken pipe, oversized line
-        sample.error = f"cli_io: {type(exc).__name__}: {exc}"[:300]
-    if sample.e2e_s is None or sample.error:
-        sample.e2e_s = time.perf_counter() - t0
-    if stopped or sample.error:
-        await _stop(proc)  # before any continuation request goes out
-    code = await proc.wait()
-    stderr = (await stderr_task).decode("utf-8", "replace").strip()
+        try:
+            await asyncio.wait_for(consume(), cfg.timeout_s)
+        except TimeoutError:
+            # a slow exit after a complete answer isn't the model's failure:
+            # only an unfinished first call is a timeout
+            if not stopped:
+                sample.error = "timeout"
+        except (OSError, ValueError) as exc:  # broken pipe, oversized line
+            sample.error = f"cli_io: {type(exc).__name__}: {exc}"[:300]
+        if sample.e2e_s is None or sample.error:
+            sample.e2e_s = time.perf_counter() - t0
+        if stopped or sample.error:
+            await _stop(proc)  # before any continuation request goes out
+        code = await proc.wait()
+        stderr = (await stderr_task).decode("utf-8", "replace").strip()
+    finally:
+        # Ctrl-C / cancellation: never leave a headless client running on the plan
+        if proc.returncode is None:
+            await asyncio.shield(_stop(proc))
+        if not stderr_task.done():
+            stderr_task.cancel()
     if sample.error:
         return sample
     sample.served_by = target.api
@@ -1915,24 +1926,30 @@ def spend(samples: list[dict[str, Any]], meta: dict[str, Any]) -> dict[str, Any]
 
 def plan_usage(samples: list[dict[str, Any]], meta: dict[str, Any]) -> dict[str, Any] | None:
     """What CLI targets drew from subscription plans: measured requests, and the
-    usage window's utilization before → after as the client reported it (warm-ups
-    included in the window, since they draw on it too). None without CLI targets."""
+    utilization of one usage window as the client reported it during the run
+    (lowest → highest reading; warm-ups count, since they draw on it too).
+
+    Readings are never compared across windows: the window is the one reported
+    most recently, and only its readings are used. None without CLI targets.
+    """
     cli = {t.get("name") for t in meta.get("targets", []) if t.get("access") == "cli"}
     if not cli:
         return None
     mine = [s for s in samples if s.get("target") in cli]
-    readings = sorted(
-        (s.get("wall_clock") or "", s["plan_utilization"], s.get("plan_window"))
+    readings = [
+        (s.get("wall_clock") or "", s["plan_window"], s["plan_utilization"])
         for s in mine
-        if s.get("plan_utilization") is not None
-    )
+        if s.get("plan_utilization") is not None and s.get("plan_window")
+    ]
+    window = max(readings)[1] if readings else None
+    levels = [u for _t, w, u in readings if w == window]
     plans = sorted({t.get("plan") for t in meta["targets"] if t.get("name") in cli} - {None})
     return {
-        "requests": sum(1 for s in mine if s.get("batch") != -1),
+        "requests": sum(1 for s in mine if not is_warmup(s)),
         "plans": plans,
-        "window": readings[-1][2] if readings else None,
-        "utilization_first": readings[0][1] if readings else None,
-        "utilization_last": readings[-1][1] if readings else None,
+        "window": window,
+        "utilization_first": min(levels) if levels else None,
+        "utilization_last": max(levels) if levels else None,
     }
 
 

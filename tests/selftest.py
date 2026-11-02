@@ -13,6 +13,7 @@ exit-code and JSON contracts in place. No network egress, no API keys.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import csv
 import json
 import os
@@ -399,6 +400,8 @@ import json, os, sys, time
 args = sys.argv[1:]
 if args[:1] == ["--version"]:
     print("9.9.9 (Claude Code)"); sys.exit(0)
+if args[:2] == ["auth", "status"] and os.environ.get("TPS_FAKE_AUTH") == "broken":
+    print("unknown option --json", file=sys.stderr); sys.exit(2)
 if args[:2] == ["auth", "status"]:
     print(json.dumps({"loggedIn": True, "authMethod": "claude.ai", "subscriptionType": "max",
                       "email": "someone@example.com"})); sys.exit(0)
@@ -415,6 +418,10 @@ def out(obj):
 def ev(event):
     out({"type": "stream_event", "event": event})
 out({"type": "system", "subtype": "init", "tools": []})
+if model == "cc-slow":  # never finishes; records its pid so a test can check it's gone
+    open(os.environ["TPS_FAKE_LOG"] + ".pid", "w").write(str(os.getpid()))
+    ev({"type": "message_start", "message": {"usage": {}}})
+    time.sleep(30); sys.exit(0)
 if model == "cc-crash":
     print("boom: something broke", file=sys.stderr); sys.exit(3)
 if model == "cc-ratelimit":
@@ -447,6 +454,8 @@ if model == "cc-capped":
     out({"type": "result", "is_error": True, "result": "exceeded the output token maximum"})
     sys.exit(1)
 message(20, "end_turn")
+if model == "cc-linger":  # a complete answer, then a slow exit
+    time.sleep(3)
 out({"type": "rate_limit_event", "rate_limit_info": {"status": "allowed",
      "rateLimitType": "five_hour",
      "unifiedWindows": {"five_hour": {"utilization": 0.25, "status": "allowed"}}}})
@@ -2238,6 +2247,31 @@ async def main() -> int:
                 not Path(str(fake_log) + ".continued").exists(),
             )
 
+            quick = core.RunConfig(targets=[], prompts={}, reps=1, concurrency=[1], timeout_s=1)
+            linger = await core.cli_once(cc("cc-linger"), "hi", "p", 512, quick, 1, 0)
+            check(
+                "cli: a slow exit after a complete answer is not a timeout",
+                linger.ok and linger.error is None,
+                str(linger.error),
+            )
+            task = asyncio.ensure_future(core.cli_once(cc("cc-slow"), "hi", "p", 64, cli_cfg, 1, 0))
+            pid_file = Path(str(fake_log) + ".pid")
+            for _ in range(50):
+                if pid_file.exists():
+                    break
+                await asyncio.sleep(0.1)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            pid = int(pid_file.read_text() or 0)
+            try:
+                os.kill(pid, 0)
+                alive = True
+            except ProcessLookupError:
+                alive = False
+            check(
+                "cli: Ctrl-C/cancel stops the client (no orphan on the plan)", not alive, str(pid)
+            )
             limited = await core.cli_once(cc("cc-ratelimit"), "hi", "p", 64, cli_cfg, 1, 0)
             check(
                 "cli: 429 → rate_limited, no retry",
@@ -2374,6 +2408,37 @@ async def main() -> int:
                 str(cli_row),
             )
             check("doctor: account email never printed", "someone@example.com" not in proc.stdout)
+            proc = tps(
+                ["doctor", "-c", "cc.toml", "--json"],
+                work,
+                env_extra={**cli_env, "TPS_FAKE_AUTH": "broken"},
+            )
+            cli_row = next(
+                (
+                    c
+                    for c in json.loads(proc.stdout or "{}").get("checks", [])
+                    if c["check"].startswith("cli ")
+                ),
+                {},
+            )
+            check(
+                "doctor: unreadable sign-in is 'unknown', not 'not signed in'",
+                "sign-in unknown" in cli_row.get("detail", "")
+                and "not signed in" not in cli_row.get("detail", ""),
+                str(cli_row),
+            )
+            (work / "cc-mockprofile.toml").write_text(
+                cc_toml.replace(str(fake), str(work / "no-such-cli"))
+                + "mock = { ttft = [1, 2] }\n\n"
+                + target_block("real-http", base, "test-model", 'api_key = "good-key"'),
+                encoding="utf-8",
+            )
+            proc = tps(["run", "-c", "cc-mockprofile.toml", "--json"], work)
+            check(
+                "cli run: a mock profile doesn't hide a missing CLI on a real run",
+                proc.returncode == 1 and "CLI not installed" in proc.stdout,
+                proc.stdout[-300:],
+            )
 
             (work / "mixed.toml").write_text(
                 '[run]\nreps = 2\nwarmup = 0\nprompts = ["prose-256"]\nbaseline = "direct"\n\n'
@@ -2576,6 +2641,90 @@ async def main() -> int:
             "effort view: several models × levels → one matrix",
             "tok/s · ttft by effort" in screen and "│ model" in screen,
             screen,
+        )
+
+        (work / "two-providers.toml").write_text(
+            '[run]\nreps = 2\nwarmup = 0\nprompts = ["prose-256"]\n\n'
+            + "".join(
+                f'[[grids]]\nname = "{p}"\nbase_url = "{base}"\napi_key = "k"\n'
+                f'extra_body = {{ provider = {{ only = ["{p}"] }} }}\n'
+                'models = ["atlas", "comet"]\neffort = ["low", "high"]\n\n'
+                for p in ("prov-a", "prov-b")
+            ),
+            encoding="utf-8",
+        )
+        screen = tps(
+            ["run", "-c", "two-providers.toml", "--mock", "-o", "tp"],
+            work,
+            env_extra={"COLUMNS": "120"},
+        ).stdout
+        check(
+            "matrix: two providers' rows both shown, none overwritten",
+            all(f"{p} · {m}" in screen for p in ("prov-a", "prov-b") for m in ("atlas", "comet")),
+            screen,
+        )
+        (work / "case.toml").write_text(grid_toml.replace('"high"]', '"high", "High"]'))
+        proc = tps(["run", "-c", "case.toml", "--dry-run", "--json"], work)
+        check("grid: effort levels compare case-insensitively", proc.returncode == 1, proc.stdout)
+        proc = tps(
+            [
+                "init",
+                "--api",
+                "claude-code",
+                "--model",
+                "a,b",
+                "--effort",
+                "low,high",
+                "--out",
+                "g4.toml",
+                "--json",
+            ],
+            work,
+        )
+        check(
+            "init: a grid reports how many targets it makes",
+            json.loads(proc.stdout or "{}").get("targets") == 4,
+            proc.stdout,
+        )
+        check(
+            "names: baseten/fast and baseten/turbo stay distinct providers",
+            tps_cli._provider({"target": "baseten/fast", "model": "m", "effort": None})
+            != tps_cli._provider({"target": "baseten/turbo", "model": "m", "effort": None})
+            and tps_cli._provider({"target": "g/m@high", "model": "m", "effort": "high"}) == "g",
+        )
+        usage = core.plan_usage(
+            [
+                {
+                    "target": "p",
+                    "batch": 0,
+                    "wall_clock": "1",
+                    "plan_window": "five_hour",
+                    "plan_utilization": 0.06,
+                },
+                {
+                    "target": "p",
+                    "batch": 1,
+                    "wall_clock": "2",
+                    "plan_window": "seven_day",
+                    "plan_utilization": 0.40,
+                },
+                {
+                    "target": "p",
+                    "batch": 2,
+                    "wall_clock": "3",
+                    "plan_window": "seven_day",
+                    "plan_utilization": 0.41,
+                },
+                {"target": "p", "batch": -1, "phase": "warmup"},
+            ],
+            {"targets": [{"name": "p", "access": "cli"}]},
+        )
+        check(
+            "plan usage: one window only, measured requests only",
+            usage["window"] == "seven_day"
+            and (usage["utilization_first"], usage["utilization_last"]) == (0.40, 0.41)
+            and usage["requests"] == 3,
+            str(usage),
         )
 
         def row(model, effort, tps_, ttft):
