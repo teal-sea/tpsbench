@@ -39,6 +39,9 @@ First public release.
   / `--effort`): measured through the signed-in `claude` CLI, context stripped,
   client retries off, only the first API call timed; `startup_p50_s` and a note
   separate CLI startup from TTFT; `doctor` checks the CLI's sign-in and plan.
+- `tps claude [opus sonnet haiku] [-e low,high|all] [-n REPS]`: the models in
+  your Claude plan in one short command, with plan defaults, a confirmation on
+  a terminal, and the exact model each alias resolved to.
 - `effort` on every target, in each API's own request shape; `[[grids]]` and
   comma lists in `--model`/`--effort` measure every model × effort level. Grids
   render as a `tok/s · ttft by effort` matrix, or rows by effort plus a "what

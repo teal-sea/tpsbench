@@ -667,6 +667,8 @@ class Sample:
     # it after this request (0–1), and which window ("five_hour")
     plan_utilization: float | None = None
     plan_window: str | None = None
+    # the model id the API says served the request ("opus" → "claude-opus-5-5")
+    served_model: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
@@ -1170,6 +1172,9 @@ async def cli_once(
             now = time.perf_counter()
             if sample.startup_s is None:
                 sample.startup_s = now - t0
+            message = obj["event"].get("message")
+            if isinstance(message, dict) and isinstance(message.get("model"), str):
+                sample.served_model = message["model"]
             event = parse_event(obj["event"], "anthropic")
             usage.update(event["usage"])
             if event["finish"]:

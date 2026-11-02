@@ -423,7 +423,8 @@ if model == "cc-ratelimit":
 time.sleep(0.05)  # client startup
 usage = {"input_tokens": 3, "cache_creation_input_tokens": 500, "cache_read_input_tokens": 0}
 def message(n, stop, think=5):
-    ev({"type": "message_start", "message": {"usage": {**usage, "output_tokens": 1}}})
+    ev({"type": "message_start",
+        "message": {"model": model + "-v9", "usage": {**usage, "output_tokens": 1}}})
     time.sleep(0.05)  # hidden thinking, never streamed
     ev({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}})
     for _ in range(n):
@@ -2171,6 +2172,11 @@ async def main() -> int:
                 f"{fast.plan_utilization} {fast.plan_window} {fast.e2e_s}",
             )
             check(
+                "cli: the model the API says served it is recorded",
+                fast.served_model == "cc-fast-v9",
+                str(fast.served_model),
+            )
+            check(
                 "cli: served_by names the client",
                 fast.served_by == "claude-code",
                 str(fast.served_by),
@@ -2597,6 +2603,41 @@ async def main() -> int:
             tps_cli.effort_takeaway(mixed_up) is None,
             str(tps_cli.effort_takeaway(mixed_up)),
         )
+
+        print("tps claude:")
+        for flag in ("-h", "--help", "--h"):
+            proc = tps(["claude", flag], work)
+            check(
+                f"claude {flag}: help with examples, exit 0",
+                proc.returncode == 0 and "tps claude opus sonnet -e low,high" in proc.stdout,
+                proc.stdout[-200:] + proc.stderr[-200:],
+            )
+        proc = tps(["claude", "--dry-run", "--json"], work)
+        plan = json.loads(proc.stdout or "{}").get("plan", {})
+        check(
+            "claude: defaults to opus, sonnet, haiku",
+            [t["target"] for t in plan.get("targets", [])]
+            == ["claude-code/opus", "claude-code/sonnet", "claude-code/haiku"],
+            proc.stdout[-300:],
+        )
+        proc = tps(["claude", "opus", "-e", "all", "--dry-run", "--json"], work)
+        plan = json.loads(proc.stdout or "{}").get("plan", {})
+        check(
+            "claude: -e all → every effort level",
+            len(plan.get("targets", [])) == len(core.EFFORTS),
+            proc.stdout[-300:],
+        )
+        proc = tps(["claude", "opus", "sonnet", "-e", "low,high", "--mock", "--json"], work)
+        out = json.loads(proc.stdout or "{}")
+        check(
+            "claude: runs like `run` (same JSON), never prompts off a terminal",
+            proc.returncode == 0
+            and out.get("command") == "run"
+            and len(out.get("results", [])) == 4,
+            proc.stdout[-300:] + proc.stderr[-300:],
+        )
+        proc = tps(["claude", "opus", "--mock", "-o", "cl"], work, env_extra={"COLUMNS": "100"})
+        check("claude: header names the command", "tps claude" in proc.stdout, proc.stdout[:300])
 
         print("report provenance:")
         (work / "unknown_rate.toml").write_text(

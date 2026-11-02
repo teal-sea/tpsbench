@@ -144,6 +144,25 @@ in `missing_credentials`.
 `"complete": false` until the end). **Ctrl-C keeps everything measured so far**,
 writes a report flagged `PARTIAL`, and exits 130.
 
+## `tps claude`
+
+The models in your Claude subscription, without a config file:
+
+```bash
+tps claude                          # opus, sonnet, haiku at their default effort
+tps claude opus sonnet -e low,high  # models × effort levels
+tps claude opus -e all              # every level
+tps claude haiku -n 10 --dry-run    # plan only
+```
+
+A shortcut for `tps run --api claude-code --model … --effort …` with plan
+defaults: 5 reps (`-n`), `--max-tokens 2048` (room to think, then answer), the
+`prose-256` prompt (`--prompt`). On a terminal it prints the dry-run plan and
+asks first; `-y` skips that, and off a terminal (`--json`, pipes, agents) it
+never asks. Output, JSON and exit codes are `run`'s. `opus`/`sonnet`/`haiku` are
+Claude Code's aliases for the latest of each; `served_models` and the box title
+name the exact model that answered. `tps claude --help` lists everything.
+
 ## `tps report`
 
 ```bash

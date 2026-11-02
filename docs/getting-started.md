@@ -66,13 +66,17 @@ usually spends the whole budget thinking and never answers (the row says so).
 `claude` CLI, so it draws on plan usage instead of money:
 
 ```bash
-tps init --api claude-code --model claude-opus-5-5 --effort high   # writes targets.toml
-tps doctor                                                         # CLI signed in? which plan?
-tps run --max-tokens 2048
+tps claude                          # opus, sonnet and haiku at their default effort
+tps claude opus sonnet -e low,high  # two models × two effort levels
+tps claude --help                   # everything else
 ```
 
-TTFT includes the CLI's own startup (the row's notes say how much); tok/s is the
-model's. See [configuration](configuration.md#claude-subscription-api-claude-code).
+It shows the plan and asks before sending anything (`-y` skips the question,
+`--dry-run` stops there). `opus`, `sonnet` and `haiku` mean the latest of each;
+the results name the exact model that served them. TTFT includes the CLI's own
+startup (the box says how much); tok/s is the model's. The long form, for
+configs and scripts: `tps run --api claude-code --model …` — see
+[configuration](configuration.md#claude-subscription-api-claude-code).
 
 **Every provider of a model, via OpenRouter:**
 

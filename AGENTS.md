@@ -40,6 +40,7 @@ tps discover    MODEL [--out FILE] [--from-json F] [--json-out F]
 tps run         [-c FILE] [-o DIR] [--reps N] [--concurrency 1,4] [--prompts a,b]
                 [--max-tokens N] [--temperature T] [--timeout S] [--dry-run] [--mock]
 tps run         --base-url URL --model ID [--api-key-env VAR] [--price IN,OUT] [...]
+tps claude      [MODEL ...] [-e LEVELS|all] [-n REPS] [--dry-run] [-y] [--mock]
 tps report      RUN_DIR [--markdown]
 tps fingerprint [-c FILE] [--reps N] [--prompt-count N] [--max-tokens N] [--timeout S] [--mock]
 ```
@@ -51,6 +52,11 @@ effective settings (overrides included), and never replaces a different
 `--api anthropic` (or `api = "anthropic"` on a target) uses the native Claude
 Messages API with an API key; it sends no `temperature` (Claude 4.7+ 400s on it)
 and keeps hidden thinking out of tok/s. A Claude **subscription** is measured with
+`tps claude [opus sonnet haiku] [-e low,high]` is the short form: it runs
+exactly `run --api claude-code` (same JSON, `command: "run"`), defaults to
+opus/sonnet/haiku, 5 reps, `--max-tokens 2048`, and asks before running only on
+a terminal — agents get no prompt. Rows carry `served_models` (the id an alias
+resolved to). Long form:
 `--api claude-code --model ID[,ID] [--effort low,high]` (or
 `api = "claude-code"`): tps runs the signed-in `claude` CLI headless — no URL,
 key or price. Never extract or replay plan OAuth tokens over HTTP: Anthropic

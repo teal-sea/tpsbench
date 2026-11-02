@@ -408,6 +408,12 @@ def summarise(samples: list[dict[str, Any]], meta: dict[str, Any]) -> dict[str, 
                 "price_out_per_1m": info.get("price_out"),
             }
         )
+    served: dict[str, set[str]] = {}
+    for sample in samples:
+        if sample.get("served_model") and sample.get("ok"):
+            served.setdefault(sample["target"], set()).add(sample["served_model"])
+    for row in rows:
+        row["served_models"] = sorted(served.get(row["target"], ()))
     return {"rows": rows, "baseline": meta.get("baseline")}
 
 
@@ -511,6 +517,7 @@ def _effort_matrix(ui: UI, rows: list[dict[str, Any]], prompt: str) -> int:
     cli = rows[0].get("access") == "cli"
     title = f"{prompt} · tok/s · ttft by effort" + (f" · {plan_title(rows)}" if cli else "")
     footer = "p50 · green = fastest tok/s"
+    footer += _alias_note(rows)
     if any(0 < r["ok"] < r["n"] for r in rows):
         footer += " · ! = some requests failed"
     if cli:
@@ -523,6 +530,16 @@ def _effort_matrix(ui: UI, rows: list[dict[str, Any]], prompt: str) -> int:
         title=title,
         footer=footer,
     )
+
+
+def _alias_note(rows: list[dict[str, Any]]) -> str:
+    """ " · opus = claude-opus-5-5" for models asked for by alias."""
+    resolved = {}
+    for r in rows:
+        ids = r.get("served_models") or []
+        if len(ids) == 1 and ids[0] != r.get("model"):
+            resolved[r.get("model")] = ids[0]
+    return "".join(f" · {alias} = {full}" for alias, full in resolved.items())
 
 
 def _effort_cost(ui: UI, rows: list[dict[str, Any]], min_inner: int = 0) -> None:
@@ -704,7 +721,7 @@ def _run_box(
     legend = "p50 · ttft first token · tok/s decode rate · itl gap between chunks"
     if cli:
         title += " · " + plan_title(rows)
-        shared = [rows[0]["model"]] if _shared(rows, "model") else []
+        shared = [_resolved(rows[0])] if _shared(rows, "model") else []
         if _shared(rows, "effort"):
             shared.append(f"effort {rows[0]['effort']}")
         if shared and _row_labels(rows)[0] != "target":
@@ -738,6 +755,13 @@ def _run_box(
             for line in rest:
                 ui.say("    " + line)
     return inner
+
+
+def _resolved(row: dict[str, Any]) -> str:
+    """The model as asked for, plus what it resolved to when that differs."""
+    ids = row.get("served_models") or []
+    asked = str(row.get("model"))
+    return f"{asked} ({ids[0]})" if len(ids) == 1 and ids[0] != asked else asked
 
 
 def _shared(rows: list[dict[str, Any]], key: str) -> bool:
@@ -1280,7 +1304,7 @@ def run_plan(
     no_cli = [] if args.mock else [t.name for t in missing_clis(cfg)]
     plan_billed = [t.name for t in cfg.targets if t.is_cli]
     ui.header(
-        "run",
+        getattr(args, "label", "run"),
         f"{_models_label(cfg)} · dry run",
         mock=args.mock,
         plan=any(t.is_cli for t in cfg.targets),
@@ -1392,7 +1416,12 @@ def cmd_run(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
     total = core.planned_requests(cfg)
     if not args.mock:
         label_plans(cfg)
-    ui.header("run", _models_label(cfg), mock=args.mock, plan=any(t.is_cli for t in cfg.targets))
+    ui.header(
+        getattr(args, "label", "run"),
+        _models_label(cfg),
+        mock=args.mock,
+        plan=any(t.is_cli for t in cfg.targets),
+    )
     ui.hint(
         f"  {_n(len(cfg.targets), 'target')} · {_n(len(cfg.prompts), 'prompt')} · {_n(cfg.reps, 'rep')} · "
         f"concurrency {','.join(map(str, cfg.concurrency))} · {total} requests"
@@ -1472,6 +1501,50 @@ def cmd_run(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
             "raw": str(outdir / "raw.jsonl"),
         },
     }
+
+
+CLAUDE_MODELS = ("opus", "sonnet", "haiku")  # Claude Code's aliases for the latest of each
+
+
+def cmd_claude(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
+    """`tps claude [models…]`: benchmark the models in your Claude plan.
+
+    A shortcut for `tps run --api claude-code …` with plan-friendly defaults;
+    it runs the very same code, so output, JSON and exit codes match `run`.
+    """
+    models = [m for arg in (args.models or CLAUDE_MODELS) for m in arg.split(",") if m]
+    efforts = None
+    if args.effort:
+        efforts = ",".join(core.EFFORTS) if args.effort.strip() == "all" else args.effort
+    run_argv = ["run", "--api", "claude-code", "--model", ",".join(models)]
+    run_argv += ["--max-tokens", str(args.max_tokens), "--reps", str(args.reps)]
+    run_argv += ["--prompts", args.prompt]
+    if efforts:
+        run_argv += ["--effort", efforts]
+    if args.out:
+        run_argv += ["-o", str(args.out)]
+    if args.mock:
+        run_argv.append("--mock")
+    run_args = build_parser().parse_args(run_argv)
+    for flag in ("json", "no_color", "quiet", "verbose"):
+        setattr(run_args, flag, getattr(args, flag, False))
+    run_args.label = "claude"
+
+    interactive = sys.stdin.isatty() and sys.stdout.isatty() and not ui.silent
+    if args.dry_run or (interactive and not args.yes and not args.mock):
+        run_args.dry_run = True
+        plan = cmd_run(run_args, ui)
+        if args.dry_run:
+            return plan
+        try:
+            answer = input("  run it on your plan? [Y/n] ").strip().lower()
+        except EOFError:
+            answer = "n"
+        if answer not in ("", "y", "yes"):
+            ui.hint("  cancelled — nothing was sent")
+            return {"command": "run", "ok": True, "cancelled": True}
+        run_args.dry_run = False
+    return cmd_run(run_args, ui)
 
 
 def cmd_report(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
@@ -1591,6 +1664,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Measure one model across many providers and gateways.",
         epilog=(
             "examples:\n"
+            "  tps claude                                 # the models in your Claude plan\n"
             "  tps run -c targets.mock.toml --mock        # 2-second offline demo\n"
             "  tps init --model deepseek/deepseek-v4.1-flash\n"
             "  tps doctor\n"
@@ -1609,10 +1683,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     def common(p: argparse.ArgumentParser) -> None:
         # mirrored on subcommands so `tps run --json` works as well as `tps --json run`
-        p.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
-        p.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS)
-        p.add_argument("-q", "--quiet", action="store_true", default=argparse.SUPPRESS)
-        p.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS)
+        p.add_argument(
+            "--json",
+            action="store_true",
+            default=argparse.SUPPRESS,
+            help="one JSON object on stdout",
+        )
+        p.add_argument(
+            "--no-color", action="store_true", default=argparse.SUPPRESS, help="no ANSI colour"
+        )
+        p.add_argument(
+            "-q", "--quiet", action="store_true", default=argparse.SUPPRESS, help="only errors"
+        )
+        p.add_argument(
+            "-v", "--verbose", action="store_true", default=argparse.SUPPRESS, help="tracebacks"
+        )
 
     def endpoint_flags(p: argparse.ArgumentParser, flag: str) -> None:
         p.add_argument(
@@ -1692,6 +1777,56 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--no-warmup", action="store_true", help="skip discarded warm-up requests")
     common(p_run)
 
+    p_claude = sub.add_parser(
+        "claude",
+        help="benchmark the models in your Claude plan",
+        description=(
+            "Benchmark the models in your Claude subscription (Pro, Max, Team) through\n"
+            "the signed-in `claude` CLI. Runs on plan usage; nothing is billed per token."
+        ),
+        epilog=(
+            "models: opus, sonnet, haiku (the latest of each), or full ids\n"
+            "effort: low, medium, high, xhigh, max, default, or all\n"
+            "\n"
+            "examples:\n"
+            "  tps claude                          opus, sonnet and haiku at default effort\n"
+            "  tps claude opus sonnet -e low,high  two models × two effort levels\n"
+            "  tps claude opus -e all              one model, every effort level\n"
+            "  tps claude haiku -n 10              more reps for a tighter number\n"
+            "  tps claude --dry-run                what it would send, and how long it takes\n"
+            "\n"
+            "the long form, for configs and scripts: tps run --api claude-code --model …"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_claude.add_argument("models", nargs="*", metavar="MODEL", help="default: opus sonnet haiku")
+    p_claude.add_argument(
+        "-e", "--effort", default=None, metavar="LEVELS", help="e.g. low,high or all"
+    )
+    p_claude.add_argument(
+        "-n", "--reps", type=int, default=5, metavar="N", help="runs per model × level (5)"
+    )
+    p_claude.add_argument(
+        "--prompt",
+        default="prose-256",
+        metavar="NAME",
+        help="prose-256 (default), code-256 or long-context",
+    )
+    p_claude.add_argument(
+        "--max-tokens",
+        type=int,
+        default=2048,
+        metavar="N",
+        help="answer cap (2048: room to think, then answer)",
+    )
+    p_claude.add_argument(
+        "-o", "--out", type=Path, default=None, metavar="DIR", help="run directory to create"
+    )
+    p_claude.add_argument("--dry-run", action="store_true", help="show the plan; send nothing")
+    p_claude.add_argument("-y", "--yes", action="store_true", help="don't ask before running")
+    p_claude.add_argument("--mock", action="store_true", help="synthetic numbers, no network")
+    common(p_claude)
+
     p_rep = sub.add_parser("report", help="re-render a previous run")
     p_rep.add_argument("run_dir", type=Path, help="folder printed by `tps run`")
     p_rep.add_argument("--markdown", action="store_true", help="print report.md instead of tables")
@@ -1715,6 +1850,7 @@ COMMANDS = {
     "init": cmd_init,
     "discover": cmd_discover,
     "run": cmd_run,
+    "claude": cmd_claude,
     "report": cmd_report,
     "fingerprint": cmd_fingerprint,
 }
