@@ -158,6 +158,37 @@ includes the prompt tokens that produced those outputs. If your workload is
 input-heavy (RAG, long context), the ranking can flip entirely — hence the
 per-request column.
 
+## CLI targets (`api = "muse-code"`)
+
+A subscription client is not an HTTP stream, so the same field names carry
+explicitly different clocks. Nothing is renamed to hide that; the differences
+are stated here and in every row note.
+
+- **TTFT** is process start to the first streamed answer text (`muse exec`
+  output delta). It includes client startup, prefill of the client's own
+  context, and hidden reasoning before the answer. `startup_p50_s` isolates the
+  first part (process start to first CLI event). The client also reports a
+  first-token time for its internal model stream; that value is recorded as
+  `provider_ttft_p50_s`, labeled as client-reported, and never substituted for
+  the measured TTFT. Never rank CLI TTFT against HTTP TTFT.
+- **ITL** is the gap between output deltas. Deltas carry a few tokens each, so
+  this is inter-delta latency; `tokens_per_chunk_median` reconciles it with
+  tok/s exactly as it does for chunky HTTP providers. The CLI exposes no
+  per-token timing, so none is reported or inferred.
+- **tok/s** uses the same decode-window math as HTTP targets, over the first to
+  last delta window, counting the streamed tokens the CLI reports in its usage
+  (output minus hidden reasoning). Reasoning tokens are never streamed by the
+  CLI and stay out of the window.
+- **Answer length is uncapped**: the CLI has no output-token cap, so `out tok`
+  is natural length, `truncated` stays 0, and rows with longer answers did more
+  work. Read tok/s next to `out tok`, as always.
+- **Plan use replaces cost.** `in_tokens` is what the model actually read
+  (client context included). There is no per-token price; `plan_usage` reports
+  the client's plan window utilization before and after the run.
+- **Retries inside the client** are counted per sample (`cli_attempts`); a row
+  note flags any response that needed more than one attempt. tps itself never
+  retries.
+
 ## What is *not* measured
 
 - **Quality.** Run an eval; speed and correctness are different questions.

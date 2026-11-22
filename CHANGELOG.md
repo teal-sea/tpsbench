@@ -36,6 +36,12 @@ First public release.
 - Native Claude API targets (`api = "anthropic"`, `--api anthropic`): works with
   API keys and Claude subscription tokens, which Anthropic's OpenAI-compatible
   endpoint rejects. `--temperature omit` / `temperature = "omit"`.
+- Muse subscription targets (`api = "muse-code"`): one model call through the
+  signed-in `muse` CLI. tps never reads the plan credential. TTFT includes
+  client startup and the client's own context, ITL is the gap between CLI
+  deltas, and token counts come from the CLI usage report. No per-token price;
+  the report records plan-window use before and after the run. Fingerprinting
+  refuses these targets (no logprobs, no sampling control).
 - Fingerprint groundwork for richer comparisons: 20 `top_logprobs` per token (5
   where a provider caps it), every alternative kept in `fingerprints.jsonl`;
   reasoning turned off on OpenRouter; `reasoning_seen` lists targets that

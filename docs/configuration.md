@@ -22,9 +22,11 @@ A config is TOML with one `[run]` table and any number of `[[targets]]` tables.
 | Key | Required | Notes |
 |---|---|---|
 | `name` | yes | shows up in reports; must be unique (every statistic is keyed by it) — keep it stable across runs |
-| `base_url` | yes | API root; `/chat/completions` is appended (`/messages` with `api = "anthropic"`) |
+| `base_url` | yes* | API root; `/chat/completions` is appended (`/messages` with `api = "anthropic"`) |
 | `model` | yes | provider's model id, not your alias |
-| `api` | no | `"openai"` (default, any OpenAI-compatible server) or `"anthropic"` (the native Claude API — see below) |
+| `api` | no | `"openai"` (default, any OpenAI-compatible server), `"anthropic"` (the native Claude API, see below), or `"muse-code"` (the signed-in Muse CLI, see below) |
+| `effort` | no | reasoning effort for CLI targets (for `muse-code`: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`); unset means the model's own default |
+| `cli` | no | CLI targets only: path or name of the client to spawn (default `muse`) |
 | `api_key_env` | no* | env var holding the key |
 | `api_key` | no* | literal key (avoid; use `api_key_env`) |
 | `headers` | no | extra request headers |
@@ -34,7 +36,7 @@ A config is TOML with one `[run]` table and any number of `[[targets]]` tables.
 | `stream_options` | no | per-target override |
 | `mock` | no | synthetic profile, **only used with `--mock`** (see below) |
 
-\* One of them, unless the endpoint is on `localhost` / `127.0.0.1` / `::1`.
+\* `base_url` is not used (and may be omitted) for CLI targets. One of the key fields is required for HTTP targets, unless the endpoint is on `localhost` / `127.0.0.1` / `::1`. CLI targets take neither: the client uses its own sign-in, and setting `api_key`, `api_key_env`, `headers`, `extra_body` or `max_tokens_field` on one is a config error.
 
 `reps`, `concurrency` and `warmup` are validated up front: a config that would
 measure nothing (0 reps, concurrency 0, unknown prompt, duplicate names) is
@@ -76,6 +78,58 @@ ANTHROPIC_API_KEY` (the URL defaults to Anthropic's).
 `[run] temperature` takes a number or `"omit"`. Unset, OpenAI-compatible targets
 get `0` and Claude API targets get nothing; `meta.json` records what each target
 was actually sent.
+
+## Muse subscription (`api = "muse-code"`)
+
+```toml
+[[targets]]
+name = "muse-spark-1.3"
+api = "muse-code"
+model = "muse-spark-1.3"
+# effort = "low"        # optional; unset uses the model's default
+# cli = "~/.local/bin/muse"   # optional; default is `muse` on PATH
+```
+
+Or with no file: `tps run --api muse-code --model muse-spark-1.3`, or scaffold
+one with `tps init --api muse-code --model muse-spark-1.3`. The shipped
+`targets.muse.toml` lists all four current models.
+
+- **The plan, through its own client.** Each request runs `muse exec --json`
+  headless on the signed-in Muse subscription (run `muse login` once).
+  tps never reads, stores or replays the plan credential; it only spawns the
+  client and times what comes back. Contributor mode is forced off for every
+  spawned run, so benchmark traffic is never contributed.
+- **One model call per request.** The agent is stripped down (`empty` preset,
+  no reminders, no web or user-input tools, one model step), the prompt goes
+  in by file, and the client runs in an empty working directory so no project
+  rules load. A reply that makes no model call (an unknown model id gets a
+  canned greeting from the client) or reports a different model than asked
+  for is recorded as a failure, never as a timed success.
+- **What the numbers mean.** TTFT runs from process start to the first streamed
+  answer text, so it includes client startup (`startup_p50_s` says how much),
+  prefill of the client's own context (tens of thousands of tokens even with
+  the stripped preset; `in_tokens` in `raw.jsonl` is what the model actually
+  read), and hidden reasoning before the answer. ITL is the gap between CLI
+  output deltas, which carry a few tokens each; `tokens_per_chunk_median`
+  keeps that honest. The CLI also reports a first-token time for its internal
+  stream; tps records it separately as `provider_ttft_p50_s` and never mixes
+  it into the measured TTFT. True per-token timing is not exposed, so none is
+  reported. Compare Muse TTFT only with other CLI rows.
+- **No token cap.** `muse exec` has no output-token cap, so prompt
+  `max_tokens` and `--max-tokens` do not bind these targets: answers come back
+  at natural length and `out tok` says how long. Warm-ups cost a full answer
+  each, which is why `targets.muse.toml` sets `warmup = 0`. No `temperature`
+  is sent either (the CLI exposes no sampling parameters).
+- **Retries.** tps adds none. The client can retry its model stream internally;
+  the attempt count is recorded as `cli_attempts` in `raw.jsonl` and a row note
+  flags any response that needed more than one.
+- **Cost columns stay empty.** There is no per-token price on a plan. Instead,
+  each sample records the plan window utilization the client reported after the
+  request, and the report, terminal and `--json` (`plan_usage`) show the window
+  before and after the run. `tps doctor` shows the signed-in plan and current
+  window use (`muse usage`).
+- **Fingerprinting refuses CLI targets**: the CLI exposes no logprobs and no
+  sampling control, so there is nothing token-level to compare.
 
 ## Pinning an upstream
 
@@ -159,6 +213,7 @@ Use it for the gateway-hop question: same upstream direct vs through the gateway
 | `targets.v4.1-flash.full.toml` | 41 | everything OpenRouter lists |
 | `targets.gateway.toml` | 3 + commented | hop overhead / routing choice |
 | `targets.example.toml` | mixed | direct vendors, pinned and unpinned gateways |
+| `targets.muse.toml` | 4 Muse models | Muse subscription via the `muse` CLI |
 
 ## Validating a config without spending money
 

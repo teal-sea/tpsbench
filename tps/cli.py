@@ -19,6 +19,7 @@ import io
 import json
 import math
 import os
+import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -108,6 +109,89 @@ def require_keys(cfg: core.RunConfig) -> None:
             )
             + " (or run with --mock)"
         )
+    missing_cli = missing_clis(cfg)
+    if missing_cli:
+        raise core.UsageError(
+            "CLI not installed for: "
+            + ", ".join(f"{t.name} (`{t.cli_binary()}`)" for t in missing_cli)
+            + " — install it and sign in, or set `cli` to its path"
+        )
+
+
+def missing_clis(cfg: core.RunConfig) -> list[core.Target]:
+    return [t for t in cfg.targets if t.is_cli and t.mock is None and not t.cli_path()]
+
+
+def muse_usage(path: str) -> dict[str, Any]:
+    """`muse usage --json`, or {} when it cannot be read. Carries no account
+    identity: only the plan tier and the used share of each window."""
+    try:
+        raw = subprocess.run(
+            [path, "usage", "--json"], capture_output=True, text=True, timeout=30
+        ).stdout
+        return json.loads(raw) if raw.strip().startswith("{") else {}
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return {}
+
+
+def _plan_name(tier: Any) -> str | None:
+    """'Muse Code Power Usage' -> 'Power'; anything else stays as reported."""
+    if not isinstance(tier, str) or not tier.strip():
+        return None
+    name = tier.removeprefix("Muse Code ").removesuffix(" Usage").strip()
+    return name or tier
+
+
+def cli_checks(cfg: core.RunConfig) -> list[tuple[str, str, bool]]:
+    """One doctor row per distinct CLI: installed, version, signed in, plan."""
+    rows = []
+    seen: set[str] = set()
+    for target in cfg.targets:
+        if not target.is_cli or target.mock is not None or target.cli_binary() in seen:
+            continue
+        binary = target.cli_binary()
+        seen.add(binary)
+        path = target.cli_path()
+        if not path:
+            rows.append((binary, "not found on PATH — install it, or set `cli` to its path", False))
+            continue
+        try:
+            version = subprocess.run(
+                [path, "--version"], capture_output=True, text=True, timeout=20
+            ).stdout.strip()
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            rows.append((binary, f"{path} · can't query it: {type(exc).__name__}", False))
+            continue
+        allowance = (muse_usage(path) or {}).get("allowance") or {}
+        if not allowance:
+            rows.append(
+                (
+                    binary,
+                    f"{version or path} · no subscription allowance — run `{binary} login`",
+                    False,
+                )
+            )
+            continue
+        plan = _plan_name(allowance.get("tier"))
+        used = (allowance.get("window") or {}).get("usedPercent")
+        detail = f"{version or path} · signed in ({plan + ' plan' if plan else 'plan unknown'}"
+        detail += f", window {used}% used)" if isinstance(used, int | float) else ")"
+        rows.append((binary, detail, True))
+    return rows
+
+
+def label_plans(cfg: core.RunConfig) -> None:
+    """Name the plan each CLI target is signed in to, for headers and reports.
+    Best effort: an unreadable usage reply just leaves it unnamed."""
+    cache: dict[str, str | None] = {}
+    for target in cfg.targets:
+        path = target.cli_path() if target.is_cli and target.mock is None else None
+        if not path:
+            continue
+        if path not in cache:
+            allowance = (muse_usage(path) or {}).get("allowance") or {}
+            cache[path] = _plan_name(allowance.get("tier"))
+        target.plan = cache[path]
 
 
 def _price_pair(text: str | None) -> tuple[float, float] | None:
@@ -135,6 +219,34 @@ def endpoint_config(
     Returns None when `flag` wasn't given, after rejecting the flags that
     only make sense with it.
     """
+    effort = getattr(args, "effort", None)
+    if args.api in core.CLI_APIS:
+        stray = [
+            name
+            for name, value in (
+                (flag, url),
+                ("--api-key-env", args.api_key_env),
+                ("--price", args.price),
+            )
+            if value is not None
+        ]
+        if stray:
+            raise core.UsageError(
+                f"{', '.join(stray)} can't apply to --api {args.api} — the CLI uses "
+                "its own sign-in (no URL, key or price)"
+            )
+        if not args.model:
+            raise core.UsageError(f"--api {args.api} needs --model, e.g. muse-spark-1.3")
+        return core.cli_target_toml(
+            args.api,
+            args.model,
+            args.name,
+            effort,
+            source=f"tps {args.command} --api {args.api}",
+            run_block=run_block,
+        )
+    if effort is not None:
+        raise core.UsageError(f"--effort only applies to --api {'/'.join(core.CLI_APIS)} so far")
     extras = {"--api-key-env": args.api_key_env, "--name": args.name, "--price": args.price}
     if flag == "--base-url":
         extras["--model"] = args.model
@@ -254,6 +366,8 @@ def summarise(samples: list[dict[str, Any]], meta: dict[str, Any]) -> dict[str, 
                 "concurrency": stats["min_conc"][prompt],
                 "ttft_p50_s": _r(st["ttft_p50_s"]),
                 "ttft_p90_s": _r(st["ttft_p90_s"]),
+                "startup_p50_s": _r(st["startup_p50_s"]),
+                "provider_ttft_p50_s": _r(st["provider_ttft_p50_s"]),
                 "first_content_p50_s": _r(st["first_content_p50_s"]),
                 "out_tps_p50": _r(st["out_tps_p50"], 2),
                 "out_tps_p90": _r(st["out_tps_p90"], 2),
@@ -278,6 +392,10 @@ def summarise(samples: list[dict[str, Any]], meta: dict[str, Any]) -> dict[str, 
                 "by_concurrency": by_conc,
                 "count_source": st["count_source"],
                 "served_by": st["served_by"],
+                "api": info.get("api", "openai"),
+                "access": info.get("access", "http"),
+                "effort": info.get("effort"),
+                "plan": info.get("plan"),
                 "price_in_per_1m": info.get("price_in"),
                 "price_out_per_1m": info.get("price_out"),
             }
@@ -323,7 +441,9 @@ def print_run_table(ui: UI, summary: dict[str, Any], prompt: str) -> None:
 
     # a rate that timed thinking, not an answer, can't be "fastest"
     best_tps = _best(rows, lambda r: None if _thinking(r) else r["out_tps_p50"], lowest=False)
-    best_ttft = _best(rows, lambda r: r["ttft_p50_s"], lowest=True)
+    # CLI TTFT includes client startup: it only competes with other CLI rows
+    mixed_access = len({r.get("access", "http") for r in rows}) > 1
+    best_ttft = None if mixed_access else _best(rows, lambda r: r["ttft_p50_s"], lowest=True)
     # a bursty ITL measures the proxy's flushing; it can't win "lowest ITL"
     best_itl = _best(rows, lambda r: None if r["bursty"] else r["itl_p50_ms"], lowest=True)
     cheapest = _best(rows, lambda r: r["price_out_per_1m"], lowest=True)
@@ -384,6 +504,8 @@ def print_run_table(ui: UI, summary: dict[str, Any], prompt: str) -> None:
 
     title = f"{prompt} · single stream" if conc == 1 else f"{prompt} · c={conc}"
     legend = "p50 · ttft first token · tok/s decode rate · itl gap between chunks"
+    if any(r.get("access") == "cli" for r in rows):
+        legend += " · CLI ttft includes client startup, compare within CLI rows"
     if estimated:
         legend += " · ≈ chars/4 estimate"
     if any(r["bursty"] for r in rows):
@@ -453,7 +575,10 @@ def print_rankings(ui: UI, summary: dict[str, Any], prompt: str) -> None:
     if rated:
         fastest = max(rated, key=lambda r: r["out_tps_p50"])
         lines.append(("▲", "fastest", fastest["target"], f"{fastest['out_tps_p50']:.1f} tok/s"))
+    # "snappiest" across access modes would crown startup, not the model
     timed = [r for r in rows if r["ttft_p50_s"] is not None]
+    if len({r.get("access", "http") for r in timed}) > 1:
+        timed = []
     if timed:
         snappiest = min(timed, key=lambda r: r["ttft_p50_s"])
         lines.append(
@@ -495,19 +620,42 @@ def attach_cost(summary: dict[str, Any], cost: dict[str, Any]) -> None:
         row["cost_usd"] = _r(cost["by_prompt"].get((row["prompt"], row["target"])), 8)
 
 
+def _plan_spend(cost: dict[str, Any]) -> str | None:
+    plan = cost.get("plan")
+    if not plan:
+        return None
+    names = "/".join(plan["plans"]) + " plan" if plan["plans"] else "plan"
+    text = f"{plan['requests']} request(s) on the {names}"
+    first, last = plan["utilization_first"], plan["utilization_last"]
+    if first is not None and last is not None:
+        text += f" · window {first:.0%} to {last:.0%} used"
+    return text
+
+
 def print_spend(ui: UI, cost: dict[str, Any]) -> None:
     if ui.silent:
         return
+    plan = _plan_spend(cost)
+    # plan targets are unpriced by nature, not missing a price
+    unpriced = [t for t in cost["unpriced"] if t not in cost.get("plan_targets", [])]
     if cost["total"] is None:
+        if plan and not unpriced:
+            ui.say()
+            ui.hint(f"  subscription use: {plan}")
+            return
         detail = "unknown — no successful request on a target with both prices"
-        if cost["unpriced"]:
-            detail += f" · no price, not counted: {', '.join(cost['unpriced'])}"
+        if unpriced:
+            detail += f" · no price, not counted: {', '.join(unpriced)}"
+        if plan:
+            detail += f" · subscription use: {plan}"
         ui.say()
         ui.hint(f"  est. spend: {detail}")
         return
     detail = f"${cost['total']:.4f} on measured requests · configured prices · warm-ups excluded"
-    if cost["unpriced"]:
-        detail += f" · no price, not counted: {', '.join(cost['unpriced'])}"
+    if unpriced:
+        detail += f" · no price, not counted: {', '.join(unpriced)}"
+    if plan:
+        detail += f" · subscription use: {plan}"
     ui.say()
     ui.hint(f"  est. spend this run: {detail}")
 
@@ -685,6 +833,8 @@ def cmd_doctor(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
         else:
             detail = "all set"
         add("credentials", mock_only or not missing, detail)
+        for binary, text, ok in cli_checks(cfg):
+            add(f"cli {binary}", ok, text)
 
         if args.network and httpx is not None:
 
@@ -700,7 +850,7 @@ def cmd_doctor(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
                         except Exception as exc:  # noqa: BLE001 - report, never crash
                             return target.name, type(exc).__name__
 
-                    return await asyncio.gather(*(one(t) for t in cfg.targets))
+                    return await asyncio.gather(*(one(t) for t in cfg.targets if not t.is_cli))
 
             for name, detail in asyncio.run(probe()):
                 # any HTTP status means the host answered; exceptions mean it didn't
@@ -743,9 +893,11 @@ def cmd_init(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
     ui.header("init")
     ui.say()
     if text is not None:
-        url = core.redact_url(core.config_from_text(text, "--endpoint").targets[0].base_url)
+        made = core.config_from_text(text, "--endpoint").targets[0]
+        url = None if made.is_cli else core.redact_url(made.base_url)
+        where = f"via `{made.cli_binary()}` (your plan)" if made.is_cli else f"at {url}"
         out.write_text(text, encoding="utf-8")
-        ui.ok(f"wrote {ui.bold(str(out))} — 1 target: {args.model} at {url}")
+        ui.ok(f"wrote {ui.bold(str(out))} — 1 target: {args.model} {where}")
         export = f"export {args.api_key_env}=… && " if args.api_key_env else ""
         ui.hint(f"  next → {export}tps run -c {out} --dry-run   (then without --dry-run)")
         return {
@@ -872,6 +1024,7 @@ def run_plan(
     """`tps run --dry-run`: the bill before the run. Nothing is sent."""
     plan = core.plan_run(cfg, mock=args.mock)
     missing = [] if args.mock else [t.name for t in cfg.targets if t.needs_key()]
+    plan_billed = [t.name for t in cfg.targets if t.is_cli]
     ui.header("run", f"{_models_label(cfg)} · dry run", mock=args.mock)
     ui.hint(
         f"  {_n(len(cfg.targets), 'target')} · {_n(len(cfg.prompts), 'prompt')} · "
@@ -906,6 +1059,8 @@ def run_plan(
         cost = f"≤ ${spend:.4f}" if spend < 1 else f"≤ ${spend:,.2f}"
         if plan["unpriced"]:
             cost += f" + unpriced: {', '.join(plan['unpriced'])}"
+    if plan_billed and not args.mock:
+        cost += f" · subscription usage: {', '.join(plan_billed)}"
     ui.say("  " + ui.kv("cost", cost, width))
     assumed = plan["assumed"]
     ui.say(
@@ -936,6 +1091,8 @@ def run_plan(
         "prompts": list(cfg.prompts),
         "plan": plan,
         "missing_credentials": missing,
+        "missing_clis": [t.name for t in missing_clis(cfg)] if not args.mock else [],
+        "subscription_targets": plan_billed,
     }
 
 
@@ -955,6 +1112,7 @@ def cmd_run(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
         return run_plan(ui, cfg, path, args)
     if not args.mock:
         require_keys(cfg)
+        label_plans(cfg)
 
     outdir = args.out or Path("runs") / stamp()
     if text is not None:
@@ -1038,6 +1196,7 @@ def cmd_run(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
         "results": summary["rows"],
         "cost_usd": _r(cost["total"], 8),
         "cost_unpriced": cost["unpriced"],
+        "plan_usage": cost["plan"],
         "failed": failed,
         # `total` is measured requests only; raw.jsonl also holds the warm-ups
         "total": len(measured),
@@ -1082,6 +1241,7 @@ def cmd_report(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
         "run_dir": str(args.run_dir),
         "cost_usd": _r(cost["total"], 8),
         "cost_unpriced": cost["unpriced"],
+        "plan_usage": cost["plan"],
         "report": text,
     }
 
@@ -1089,6 +1249,12 @@ def cmd_report(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
 def cmd_fingerprint(args: argparse.Namespace, ui: UI) -> dict[str, Any]:
     path = resolve_config(args.config)
     cfg = core.load_config(path)
+    cli_targets = [t.name for t in cfg.targets if t.is_cli]
+    if cli_targets:
+        raise core.UsageError(
+            f"fingerprint can't use CLI targets ({', '.join(cli_targets)}): a CLI exposes no "
+            "logprobs or sampling control — remove them from this config"
+        )
     for flag, value in (
         ("--reps", args.reps),
         ("--prompt-count", args.prompt_count),
@@ -1208,7 +1374,14 @@ def build_parser() -> argparse.ArgumentParser:
             choices=core.APIS,
             default=None,
             help=f"wire format (default openai); anthropic = native Claude API, {CLAUDE_API_URL} "
-            "unless a URL is given — accepts API keys and Claude subscription tokens",
+            "unless a URL is given — accepts API keys and Claude subscription tokens; "
+            "muse-code = your Muse plan, via the signed-in `muse` CLI (no URL or key)",
+        )
+        p.add_argument(
+            "--effort",
+            default=None,
+            metavar="LEVEL",
+            help="reasoning effort (CLI targets); default: the model's own",
         )
         p.add_argument("--api-key-env", default=None, help="env var holding the key")
         p.add_argument("--name", default=None, help="target name (default: the host)")

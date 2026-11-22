@@ -45,7 +45,10 @@ tps doctor [-c FILE] [--network]
 
 Checks Python ≥ 3.11, `httpx`, `h2`, config parse, and whether every target that
 needs a key has one (targets on `localhost`/`127.0.0.1`/`::1` don't; a mock-only
-config doesn't). `--network` additionally probes each `base_url` (5s timeout) —
+config doesn't). For each CLI target (`api = "muse-code"`) it checks the client
+binary, its version, and the signed-in plan with current window use
+(`muse usage --json`; no account identity is shown). `--network` additionally
+probes each `base_url` (5s timeout; CLI targets have no URL and are skipped):
 any HTTP status counts as reachable, any connection error or timeout does not.
 
 Exit 0 when every critical check passes, 2 when only credentials are missing,
@@ -57,6 +60,7 @@ Exit 0 when every critical check passes, 2 when only credentials are missing,
 tps init [--out targets.toml] [--force]
 tps init --endpoint URL --model ID [--api-key-env VAR] [--name NAME] [--price IN,OUT]
 tps init --api anthropic --model claude-opus-5-5 --api-key-env ANTHROPIC_API_KEY
+tps init --api muse-code --model muse-spark-1.3 [--effort LEVEL]
 tps init --model SLUG
 ```
 
@@ -65,6 +69,10 @@ With `--endpoint`: writes a one-target config for any OpenAI-compatible
 endpoint — no gateway, no OpenRouter key. `--price` is USD per 1M input,output
 tokens and fills the cost columns; `--name` defaults to the URL's host. Add more
 `[[targets]]` blocks to compare.
+With `--api muse-code --model ID`: writes a one-target config for a Muse
+subscription model, measured through the signed-in `muse` CLI (no URL, key or
+price; `--effort` sets the reasoning effort). See
+[configuration](configuration.md#muse-subscription-api-muse-code).
 With `--model` alone: behaves like `discover --out`, generating one pinned
 target per OpenRouter endpoint (needs network; uses `OPENROUTER_API_KEY` if set).
 
@@ -97,6 +105,7 @@ tps run [-c FILE] [-o DIR] [--reps N] [--concurrency 1,4,16]
         [--dry-run] [--mock] [--no-warmup]
 tps run --base-url URL --model ID [--api-key-env VAR] [--name NAME] [--price IN,OUT] [...]
 tps run --api anthropic --model ID --api-key-env VAR [...]      # native Claude API
+tps run --api muse-code --model ID [--effort LEVEL] [...]       # Muse plan, via the muse CLI
 ```
 
 | Flag | Default | Notes |
@@ -120,8 +129,14 @@ endpoint directly (with `--api-key-env`, `--name`, `--price` as in `init
 `--max-tokens`, `--temperature`, …), so `-c` repeats it exactly; a different
 `targets.toml` already there is never replaced (pick another `-o`). `--api
 anthropic` speaks the native Claude Messages API instead (URL defaults to
-`https://api.anthropic.com/v1`; takes API keys and Claude subscription tokens) —
-see [configuration](configuration.md#claude-api-anthropic).
+`https://api.anthropic.com/v1`; takes API keys and Claude subscription tokens),
+see [configuration](configuration.md#claude-api-anthropic). `--api muse-code`
+measures a Muse subscription model through the signed-in `muse` CLI (no URL
+or key; `--effort` sets the reasoning effort), see
+[configuration](configuration.md#muse-subscription-api-muse-code). For CLI
+targets the dry-run token budget describes the tps prompt only: the client adds
+a large fixed context of its own that no outside tool can budget for, and
+`max_tokens` does not cap its answers.
 
 Cost model: requests = targets × prompts × reps × Σ(concurrency), plus
 `warmup` per target. A curated 11-target run at 1 prompt, 7 reps, concurrency
@@ -163,7 +178,9 @@ tps fingerprint [-c FILE] [-o DIR] [--reps 2] [--prompt-count 2] [--max-tokens 1
 
 Sends the same prompt `--reps` times per target at temperature 0 (unless the
 config says `temperature = "omit"`), non-streaming, with `logprobs` and 20
-`top_logprobs` (5 where a provider caps it), and compares token sequences. On
+`top_logprobs` (5 where a provider caps it), and compares token sequences. CLI
+targets (`api = "muse-code"`) are refused: the client exposes no logprobs or
+sampling control. On
 OpenRouter targets reasoning is turned off (`reasoning = {enabled = false}`;
 `extra_body.reasoning` overrides). Writes `fingerprints.jsonl` — each row keeps
 the full `top_logprobs` per position and any `reasoning_tokens` — and
@@ -207,7 +224,8 @@ usage errors name the subcommand in `"command"`.
     "prompt": "prose-256", "target": "deepinfra", "model": "...",
     "base_url": "https://openrouter.ai/api/v1", "pin": {"only": ["deepinfra/fp8"]},
     "concurrency": 1,
-    "ttft_p50_s": 0.42, "ttft_p90_s": 0.55, "first_content_p50_s": 0.42,
+    "ttft_p50_s": 0.42, "ttft_p90_s": 0.55, "startup_p50_s": null,
+    "provider_ttft_p50_s": null, "first_content_p50_s": 0.42,
     "out_tps_p50": 78.3, "out_tps_p90": 70.1,
     "itl_p50_ms": 12.0, "itl_n": 7, "first_content_n": 7,
     "tokens_per_chunk_median": 1.0, "bursty": 0,
@@ -221,9 +239,10 @@ usage errors name the subcommand in `"command"`.
       "4": {"ttft_p50_s": 0.51, "out_tps_p50": 61.0, "aggregate_tps": 240.5, "ok": 27, "n": 28, "errors": {"rate_limited": 1}}
     },
     "count_source": ["usage"], "served_by": ["DeepInfra"],
+    "api": "openai", "access": "http", "effort": null, "plan": null,
     "price_in_per_1m": 0.14, "price_out_per_1m": 0.42
   }],
-  "cost_usd": 0.1943, "cost_unpriced": ["together"],
+  "cost_usd": 0.1943, "cost_unpriced": ["together"], "plan_usage": null,
   "failed": 1, "total": 385, "warmup_requests": 22, "planned_requests": 407,
   "artifacts": {"report": "...", "csv": "...", "raw": "..."}
 }
@@ -264,6 +283,16 @@ measures a proxy's flushing, not the model — see
 [metrics](metrics.md#itl-inter-token-latency). `tokens_per_chunk_median` is what
 reconciles ITL with tok/s.
 
+CLI targets (`api = "muse-code"`, `access = "cli"`) add `startup_p50_s` (process
+start to first CLI event; it is part of `ttft_p50_s`), `provider_ttft_p50_s`
+(the first-token time the client reports for its internal stream, kept separate
+from the measured TTFT), `effort` and `plan`. Their spend is not in `cost_usd`:
+`plan_usage` instead reports the measured request count and the plan window
+utilization the client reported before and after the run (`report --json`
+returns the same). Per-sample `cli_attempts` in `raw.jsonl` counts model-stream
+attempts inside the client (1 means no internal retry). New error classes:
+`cli_missing`, `cli_exit_<n>`, `cli_error`, `cli_io`, `model_mismatch`.
+
 ### `run --dry-run`
 
 ```json
@@ -276,8 +305,12 @@ reconciles ITL with tok/s.
    "cost_max_usd":0.1014,"unpriced":["openrouter auto"],
    "est_minutes":19.5,"assumed":{"tok_s":40.0,"ttft_s":1.0,"template_tokens":32},
    "targets":[{"target":"deepinfra (fp8)","requests":37,"cost_max_usd":0.0045}]},
- "missing_credentials":[]}
+ "missing_credentials":[],"missing_clis":[],"subscription_targets":[]}
 ```
+
+`missing_clis` names CLI targets whose client binary was not found (the real run
+would exit 1); `subscription_targets` names the targets that would draw on a
+subscription plan instead of a per-token price.
 
 Latency and rate fields describe the lowest concurrency (`concurrency`);
 `ok`/`n`/`errors` count every level; `by_concurrency` breaks both down.
