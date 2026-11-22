@@ -1,0 +1,48 @@
+# Muse subscription models, measured through the signed-in `muse` CLI.
+#
+#   muse login                     # once; tps never reads the credential
+#   tps doctor -c targets.muse.toml
+#   tps run -c targets.muse.toml --dry-run
+#   tps run -c targets.muse.toml
+#
+# Unlike the HTTP configs, these rows compare *models* on one plan, not one
+# model across providers. Read the honesty notes before ranking anything:
+#
+# - TTFT runs from `muse exec` process start to the first answer text. It
+#   includes client startup, prefill of the client's own context (tens of
+#   thousands of tokens even with the stripped `empty` preset tps uses), and
+#   hidden reasoning before the answer. Never rank it against HTTP TTFT.
+# - ITL is the gap between CLI output deltas, not between tokens; the report's
+#   tok/chunk column shows how much text each delta carried.
+# - `muse exec` has no output-token cap, so max_tokens does not bind these
+#   targets: answers come back at natural length and `out tok` says how long.
+#   Warm-ups would cost a full answer each, so warmup is 0 here.
+# - Token counts and plan use come from the CLI's own usage report; tps adds
+#   no retries (retries inside the client are counted in raw.jsonl).
+
+[run]
+reps = 3
+concurrency = [1]
+warmup = 0
+timeout_s = 300
+prompts = ["prose-256", "code-256"]
+
+[[targets]]
+name = "muse-wonder-full-1.0"
+api = "muse-code"
+model = "muse-wonder-full-1.0"
+
+[[targets]]
+name = "muse-wonder-1.0"
+api = "muse-code"
+model = "muse-wonder-1.0"
+
+[[targets]]
+name = "muse-spark-1.3"
+api = "muse-code"
+model = "muse-spark-1.3"
+
+[[targets]]
+name = "muse-spark-1.2"
+api = "muse-code"
+model = "muse-spark-1.2"

@@ -62,6 +62,18 @@ Your own endpoint, no OpenRouter and no config file:
 tps run --base-url https://api.example.com/v1 --model <id> --api-key-env EXAMPLE_API_KEY --dry-run
 ```
 
+A Muse subscription, through the signed-in `muse` CLI (no URL, no key; tps
+never reads the credential):
+
+```bash
+tps doctor -c targets.muse.toml
+tps run -c targets.muse.toml --dry-run
+```
+
+Those rows are not comparable to HTTP TTFT. The client adds its own context,
+and `muse exec` has no output cap. See
+[configuration](docs/configuration.md#muse-subscription-api-muse-code).
+
 Every provider of your model: `tps init --model <author>/<slug>` writes one
 pinned target per OpenRouter endpoint into `targets.toml`. That can be 40+
 targets — `tps run --dry-run` prints the requests, worst-case cost and rough time

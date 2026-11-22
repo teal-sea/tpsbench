@@ -395,6 +395,57 @@ def target_block(name: str, base: str, model: str, extra: str = "") -> str:
     return f'[[targets]]\nname = "{name}"\nbase_url = "{base}"\nmodel = "{model}"\n{extra}\n'
 
 
+# A stand-in for the `muse` CLI: replays `muse exec --json` JSONL (output
+# deltas, run usage, terminal event) by model name, and records what tps
+# passed it. No network, no account, no real subscription calls.
+FAKE_MUSE = r"""
+import json, os, sys, time
+args = sys.argv[1:]
+if args[:1] == ["--version"]:
+    print("Muse Code 9.9.9 (test)"); sys.exit(0)
+if args[:1] == ["usage"]:
+    print(json.dumps({"allowance": {"tier": "Muse Code Power Usage",
+                                    "window": {"usedPercent": 14},
+                                    "weekly": {"usedPercent": 22}}})); sys.exit(0)
+model = args[args.index("--model") + 1]
+prompt = open(args[args.index("--prompt-file") + 1], encoding="utf-8").read()
+with open(os.environ["TPS_FAKE_LOG"], "a") as log:
+    log.write(json.dumps({"model": model, "argv": args, "prompt": prompt,
+                          "cwd": os.getcwd()}) + "\n")
+def out(payload_type, payload):
+    print(json.dumps({"payload_type": payload_type, "payload": payload}), flush=True)
+if model == "muse-crash":
+    print("boom: something broke", file=sys.stderr); sys.exit(3)
+time.sleep(0.05)  # client startup, before the first event
+out("run.model.configured", {"model_id": model})
+if model == "muse-unknown":
+    # an unknown id makes the real client answer with no model call at all
+    out("run.output.delta", {"text": "Hi! How can I help you today?"})
+    out("run.usage", {"calls": 0, "failed_calls": 0, "models": []})
+    out("run.terminal.completed", {"terminal": "completed", "text": "Hi!"})
+    sys.exit(0)
+if model == "muse-ratelimit":
+    out("run.usage", {"calls": 1, "failed_calls": 1, "models": []})
+    out("run.terminal.failed", {"terminal": "failed", "reason": "rate limit reached (429)"})
+    sys.exit(1)
+time.sleep(0.05)  # hidden reasoning, never streamed
+for _ in range(20):
+    out("run.output.delta", {"text": "word"})
+    time.sleep(0.01)
+attempt = 3 if model == "muse-retried" else 1
+out("task.lifecycle.status", {"event": {"details": {"phase": "stream_succeeded", "facets": [
+    {"kind": "external_attempt", "attempt": attempt, "max_attempts": 10},
+    {"kind": "producer", "detail": {"stream": {"time_to_first_token_ms": 42}}}]}}})
+served = "some-other-model" if model == "muse-mismatch" else model
+out("run.usage", {"calls": 1, "failed_calls": 0,
+                  "allowance": {"window": {"used_percent": 15}},
+                  "models": [{"model": served, "calls": 1, "input_tokens": 19500,
+                              "output_tokens": 25, "reasoning_tokens": 5,
+                              "cached_tokens": 0}]})
+out("run.terminal.completed", {"terminal": "completed", "text": "word" * 20})
+"""
+
+
 async def main() -> int:
     server, base = serve()
     failures: list[str] = []
@@ -2076,6 +2127,257 @@ async def main() -> int:
             cost_row.rstrip(" |").endswith("—"),
             cost_row,
         )
+
+        print("CLI targets (muse-code, fake client):")
+        fake = work / "fake-muse"
+        fake.write_text(f"#!{sys.executable}\n{FAKE_MUSE}", encoding="utf-8")
+        fake.chmod(0o755)
+        fake_log = work / "fake-muse.log"
+        cli_env = {"TPS_FAKE_LOG": str(fake_log), "XDG_CACHE_HOME": str(work / "cache")}
+        saved_env = {k: os.environ.get(k) for k in cli_env}
+        os.environ.update(cli_env)
+        try:
+
+            def mc(model: str, **kw) -> core.Target:
+                return core.Target(
+                    name=model, base_url="", model=model, api="muse-code", cli=str(fake), **kw
+                )
+
+            cli_cfg = core.RunConfig(targets=[], prompts={}, reps=1, concurrency=[1], timeout_s=20)
+            fast = await core.cli_once(
+                mc("muse-fast", effort="high"), "hi", "p", 512, cli_cfg, 1, 0
+            )
+            check("muse: ok", fast.ok, str(fast.error))
+            check(
+                "muse: token counts from the CLI usage report",
+                fast.out_tokens == 25 and fast.in_tokens == 19500 and fast.count_source == "usage",
+                f"{fast.out_tokens} {fast.in_tokens} {fast.count_source}",
+            )
+            check(
+                "muse: hidden reasoning kept out of tok/s",
+                fast.hidden_reasoning_tokens == 5 and fast.reasoning_tokens == 5,
+                f"{fast.hidden_reasoning_tokens} {fast.reasoning_tokens}",
+            )
+            check(
+                "muse: tok/s ~ fake delta pace (100/s, 1 token per delta)",
+                fast.out_tps is not None
+                and 50 <= fast.out_tps <= 130
+                and fast.tokens_per_chunk == 1.0,
+                f"{fast.out_tps} {fast.tokens_per_chunk}",
+            )
+            check(
+                "muse: startup recorded, inside TTFT",
+                fast.startup_s is not None
+                and fast.ttft_s is not None
+                and 0.04 <= fast.startup_s < fast.ttft_s,
+                f"{fast.startup_s} {fast.ttft_s}",
+            )
+            check(
+                "muse: client-reported first token kept separate from TTFT",
+                fast.provider_ttft_s == 0.042 and fast.provider_ttft_s != fast.ttft_s,
+                f"{fast.provider_ttft_s} {fast.ttft_s}",
+            )
+            check(
+                "muse: plan window read from run usage",
+                fast.plan_utilization == 0.15 and fast.plan_window == "window",
+                f"{fast.plan_utilization} {fast.plan_window}",
+            )
+            check(
+                "muse: served_by is the model the CLI reported",
+                fast.served_by == "muse-fast",
+                str(fast.served_by),
+            )
+            logged = [json.loads(line) for line in fake_log.read_text().splitlines()]
+            call = logged[-1]
+            check("muse: prompt passed by file", call["prompt"] == "hi", repr(call["prompt"]))
+            argv = call["argv"]
+            check(
+                "muse: agent stripped to one model call, contributor mode off",
+                argv[argv.index("--preset") + 1] == "empty"
+                and argv[argv.index("--max-model-steps") + 1] == "1"
+                and argv[argv.index("--contributor-mode") + 1] == "off"
+                and argv[argv.index("--reasoning-effort") + 1] == "high",
+                str(argv),
+            )
+            check(
+                "muse: runs in a stable empty workdir",
+                call["cwd"] == str(work / "cache" / "tps" / "cli-workdir"),
+                call["cwd"],
+            )
+
+            for model, prefix in (
+                ("muse-unknown", "cli_error"),
+                ("muse-mismatch", "model_mismatch"),
+                ("muse-ratelimit", "rate_limited"),
+                ("muse-crash", "cli_exit_3"),
+            ):
+                failed_one = await core.cli_once(mc(model), "hi", "p", 64, cli_cfg, 1, 0)
+                check(
+                    f"muse: {model} -> {prefix}, never a timed success",
+                    not failed_one.ok and (failed_one.error or "").startswith(prefix),
+                    str(failed_one.error),
+                )
+            gone = await core.cli_once(
+                core.Target(
+                    name="g",
+                    base_url="",
+                    model="m",
+                    api="muse-code",
+                    cli=str(work / "no-such-cli"),
+                ),
+                "hi",
+                "p",
+                64,
+                cli_cfg,
+                1,
+                0,
+            )
+            check(
+                "muse: missing binary is an error sample",
+                (gone.error or "").startswith("cli_missing"),
+                str(gone.error),
+            )
+            retried_one = await core.cli_once(mc("muse-retried"), "hi", "p", 64, cli_cfg, 1, 0)
+            retry_notes = core.row_notes(
+                core.bucket_stats(
+                    next(iter(core.summarize([retried_one.as_dict()])["buckets"].values()))
+                )
+            )
+            check(
+                "muse: retries inside the client stay visible",
+                retried_one.ok
+                and retried_one.cli_attempts == 3
+                and any("retried its model stream" in n for n in retry_notes),
+                f"{retried_one.cli_attempts} {retry_notes}",
+            )
+
+            muse_toml = (
+                '[run]\nreps = 2\nwarmup = 0\nprompts = ["prose-256"]\n\n'
+                f'[[targets]]\nname = "plan"\napi = "muse-code"\nmodel = "muse-fast"\n'
+                f'effort = "low"\ncli = "{fake}"\n'
+            )
+            (work / "muse.toml").write_text(muse_toml, encoding="utf-8")
+            proc = tps(
+                ["run", "-c", "muse.toml", "-o", "muse-run", "--json"], work, env_extra=cli_env
+            )
+            out_payload = json.loads(proc.stdout or "{}")
+            row = (out_payload.get("results") or [{}])[0]
+            check(
+                "muse run: exit 0, all ok",
+                proc.returncode == 0 and row.get("ok") == 2,
+                f"{proc.returncode} {proc.stderr[-300:]}",
+            )
+            check(
+                "muse run: startup and client-reported TTFT in JSON",
+                row.get("startup_p50_s") is not None and row.get("provider_ttft_p50_s") == 0.042,
+                str(row)[:300],
+            )
+            check(
+                "muse run: notes flag CLI startup in TTFT",
+                any("CLI target" in n for n in row.get("notes", [])),
+                str(row.get("notes")),
+            )
+            plan_usage = out_payload.get("plan_usage") or {}
+            check(
+                "muse run: plan usage before/after in JSON",
+                plan_usage.get("requests") == 2
+                and plan_usage.get("utilization_last") == 0.15
+                and plan_usage.get("plans") == ["Power"],
+                str(plan_usage),
+            )
+            meta = json.loads((work / "muse-run" / "meta.json").read_text())
+            check(
+                "muse run: meta records access, effort and plan",
+                meta["targets"][0].get("access") == "cli"
+                and meta["targets"][0].get("effort") == "low"
+                and meta["targets"][0].get("plan") == "Power",
+                str(meta["targets"][0]),
+            )
+
+            proc = tps(
+                [
+                    "run",
+                    "--api",
+                    "muse-code",
+                    "--model",
+                    "muse-fast",
+                    "--effort",
+                    "max",
+                    "--dry-run",
+                    "--json",
+                ],
+                work,
+                env_extra=cli_env,
+            )
+            dry = json.loads(proc.stdout or "{}")
+            check(
+                "muse dry-run: no URL or key needed",
+                proc.returncode == 0
+                and dry.get("missing_credentials") == []
+                and dry.get("subscription_targets") == ["muse-code/muse-fast@max"],
+                f"{proc.returncode} {proc.stdout[-300:]}",
+            )
+
+            (work / "muse-missing.toml").write_text(
+                muse_toml.replace(str(fake), str(work / "no-such-cli")), encoding="utf-8"
+            )
+            proc = tps(["run", "-c", "muse-missing.toml", "--dry-run", "--json"], work)
+            check(
+                "muse dry-run: missing CLI listed",
+                json.loads(proc.stdout or "{}").get("missing_clis") == ["plan"],
+                proc.stdout,
+            )
+            proc = tps(["run", "-c", "muse-missing.toml", "--json"], work)
+            check(
+                "muse run: missing CLI -> exit 1 + JSON error",
+                proc.returncode == 1 and "CLI not installed" in proc.stdout,
+                proc.stdout,
+            )
+
+            for label, text in (
+                ("api_key_env on a CLI target", muse_toml + 'api_key_env = "X"\n'),
+                ("unknown effort", muse_toml.replace('"low"', '"turbo"')),
+            ):
+                (work / "muse-bad.toml").write_text(text, encoding="utf-8")
+                proc = tps(["run", "-c", "muse-bad.toml", "--dry-run", "--json"], work)
+                check(f"muse config: {label} -> exit 1", proc.returncode == 1, proc.stdout)
+            (work / "effort-http.toml").write_text(
+                "[run]\nreps = 1\n\n" + target_block("h", base, "test-model", 'effort = "low"'),
+                encoding="utf-8",
+            )
+            proc = tps(["run", "-c", "effort-http.toml", "--dry-run", "--json"], work)
+            check(
+                "muse config: effort on an HTTP target -> exit 1",
+                proc.returncode == 1,
+                proc.stdout,
+            )
+
+            proc = tps(["doctor", "-c", "muse.toml", "--json"], work, env_extra=cli_env)
+            doc = json.loads(proc.stdout or "{}")
+            cli_row = next((c for c in doc.get("checks", []) if c["check"].startswith("cli ")), {})
+            check(
+                "doctor: muse signed in + plan shown",
+                cli_row.get("ok") and "Power" in cli_row.get("detail", ""),
+                str(cli_row),
+            )
+            proc = tps(["fingerprint", "-c", "muse.toml", "--json"], work, env_extra=cli_env)
+            check(
+                "muse: fingerprint refuses CLI targets",
+                proc.returncode == 1 and "CLI targets" in proc.stdout,
+                proc.stdout,
+            )
+            shipped = core.load_config(ROOT / "targets.muse.toml")
+            check(
+                "muse: shipped config parses as four CLI targets",
+                len(shipped.targets) == 4 and all(t.is_cli for t in shipped.targets),
+                str([t.model for t in shipped.targets]),
+            )
+        finally:
+            for key, value in saved_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
     finally:
         server.shutdown()
 
